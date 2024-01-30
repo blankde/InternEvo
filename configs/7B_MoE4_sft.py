@@ -143,7 +143,7 @@ model = dict(
     num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
     num_experts=4,
     moe_use_residual=False,
-    moe_type="GShard",
+    moe_type="GShard",  # moe_type can be "Naive", "GShard", "Mixtral"
 )
 
 # zero1 parallel:
@@ -177,6 +177,7 @@ monitor = dict(
 )
 
 # custom moe impl configs
+# GShard MoE config
 moe = dict(
     top_k=2,
     capacity_factor=1.0,
@@ -186,6 +187,17 @@ moe = dict(
     drop_tokens=True,
     use_rts=True,
 )
+
+# Naive MoE config
+# moe = dict(
+#    top_k=2,
+# )
+
+# Mixtral MoE config
+# moe = dict(
+#    top_k=2,
+#    parallel_mode="tensor", # parallel_mode can be tensor or weight
+# )
 
 model_type = "INTERNLM_MoE"
 

@@ -60,4 +60,4 @@ class AllToAll(torch.autograd.Function):
 
 
 def all_to_all(x, output_split_sizes=None, input_split_sizes=None, group=None, async_op=False):
-    return AllToAll.apply(x, group, output_split_sizes, input_split_sizes, async_op)
+    return AllToAll.apply(x, output_split_sizes, input_split_sizes, group, async_op)
