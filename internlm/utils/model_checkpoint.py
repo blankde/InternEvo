@@ -231,7 +231,7 @@ def try_load_internlm_ckpt(ckpt_mm, load_info, train_state: TrainState):
         # load training states.
         load_context(load_ckpt_folder, train_state)
 
-        # load optimzier states.
+        # load optimizer states.
         if load_content.need_load(CheckpointLoadContent.OPIMIZER):
             load_optimizer_checkpoint(load_ckpt_folder, ckpt_mm.optimizer)
             load_content_str += f"{CheckpointLoadContent.OPIMIZER}, "
@@ -247,6 +247,12 @@ def try_load_internlm_ckpt(ckpt_mm, load_info, train_state: TrainState):
             else:
                 if gpc.is_rank_for_log():
                     logger.warning("CheckpointManager has no 'lr_scheduler', skip reload lr_scheduler checkpoint!")
+
+            if not load_content.need_load(CheckpointLoadContent.OPIMIZER):
+                if ckpt_mm.lr_scheduler and train_state:
+                    gpc.config.only_load_lr = True
+                    load_optimizer_checkpoint(load_ckpt_folder, ckpt_mm.optimizer)
+                    gpc.config.only_load_lr = False
 
         # load dataloader sampler states.
         if load_content.need_load(CheckpointLoadContent.SAMPLER):
@@ -364,7 +370,7 @@ def load_llama_pretrained_weights(folder, model):
 
     current_states = {}
     for idx, i in enumerate(range(model.first_layer, model.last_layer)):
-        if gpc.config.model_type == "LLAMA":
+        if gpc.config.model_type == "LLAMA2":
             # LLAMA's w2 and w3 are in reverse order
             w2 = states.pop(f"layers.{i}.feed_forward.w2.weight")
             w3 = states.pop(f"layers.{i}.feed_forward.w3.weight")
@@ -419,7 +425,7 @@ def load_hf_llama_pretrained_weights(folder, model):
 
     current_states = {}
     for idx, i in enumerate(range(model.first_layer, model.last_layer)):
-        if gpc.config.model_type == "LLAMA":
+        if gpc.config.model_type == "LLAMA2":
             if deep_split:
                 layer_ids = i // 2
             else:
@@ -606,9 +612,9 @@ def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
             # get all moe parameters
             moe_state_dict = {}
             for n, p in module.state_dict().items():
-                if "expert" in n and "moe_layer.gate.wg.weight" not in n:
+                if "expert" in n and "moe_layer.gate" not in n:
                     moe_state_dict[n_module + "." + n] = p
-            moe_str_prefix = ".moe_layer.experts.experts."
+            moe_str_prefix = ".moe_layer.experts.wrapped_experts."
             # Reorder the moe name rank, so that each checkpoint only has one expert
             experts_state_dict = defaultdict(dict)
             for key in list(moe_state_dict.keys()):
@@ -641,7 +647,7 @@ def get_non_moe_state_dict(full_state_dict):
     Get the state dict of the non-moe layers
     """
     for key in list(full_state_dict.keys()):
-        if "expert" in key and "moe_layer.gate.wg.weight" not in key:
+        if "expert" in key and "moe_layer.gate" not in key:
             full_state_dict.pop(key)
 
     return full_state_dict
@@ -690,7 +696,7 @@ def try_load_moe_checkpoint(folder, model, state_dict, tp_rank, pp_rank):
                 fp = os.path.join(folder, fn)
                 expert_state_dict = llm_load(fp, map_location=get_current_device())
                 # Updating global -> local expert ids
-                moe_str_prefix = ".moe_layer.experts.experts."
+                moe_str_prefix = ".moe_layer.experts.wrapped_experts."
                 for key in list(expert_state_dict.keys()):
                     local_key = key.replace(f"{moe_str_prefix}{global_expert_id}", f"{moe_str_prefix}{local_expert_id}")
                     expert_state_dict[local_key] = expert_state_dict.pop(key)
@@ -911,6 +917,11 @@ class CheckpointManager:
                 and "content" in self.load_ckpt_info
                 and "ckpt_type" in self.load_ckpt_info
             ), "please set content in ckpt setting, eg: ckpt = dict(path='', content=['model'], ckpt_type='internlm')"
+
+            if self.load_ckpt_info["content"] != ("model",):
+                assert (
+                    self.load_ckpt_info["ckpt_type"] == "internlm"
+                ), "Only 'internlm' ckpt supports loading states other than 'model' !"
 
             # replace load_ckpt
             self.load_ckpt_info["content"] = CheckpointLoadMask(self.load_ckpt_info["content"])

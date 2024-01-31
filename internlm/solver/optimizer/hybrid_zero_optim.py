@@ -150,7 +150,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             # if zero is used, expert dp group will use ParallelMode.EXPERT_DATA as the real zero mode
             zero_mode = (
                 ParallelMode.ZERO1
-                if param_group["dp_mode"] == gpc.get_world_size(ParallelMode.ZERO1) == 1 or ParallelMode.DATA
+                if gpc.get_world_size(ParallelMode.ZERO1) == 1 or param_group["dp_mode"] == ParallelMode.DATA
                 else ParallelMode.EXPERT_DATA
             )
             self._zero_local_rank.append(gpc.get_local_rank(zero_mode))
@@ -219,10 +219,7 @@ class HybridZeroOptimizer(BaseOptimizer):
         # flag used to skip unnecessary gradient reduce operation when gradient accumulation is enabled.
         self.skip_grad_reduce = False
 
-        # reduction hook is only used if overlapping communication
-        # if it is stage 1 without overlapping, no hook will be attached
-        if self._overlap_sync_grad:
-            self._attach_reduction_hook()
+        self._attach_reduction_hook()
 
     @property
     def zero_local_rank(self):
@@ -321,12 +318,15 @@ class HybridZeroOptimizer(BaseOptimizer):
 
                         # if sequence_parallel is True,
                         # the grad of norm should be all-reduce across the tp process group
-                        if gpc.config.parallel.sequence_parallel is True:
-                            if hasattr(param, IS_SEQUENCE_PARALLEL) and getattr(param, IS_SEQUENCE_PARALLEL) is True:
-                                accum_grad_obj_sp = get_grad_accumulate_object(param)
-                                accum_grad_obj_sp.register_hook(reduce_grad_hook_sp)
+                        if (
+                            gpc.config.parallel.sequence_parallel is True
+                            and hasattr(param, IS_SEQUENCE_PARALLEL)
+                            and getattr(param, IS_SEQUENCE_PARALLEL) is True
+                        ):
+                            accum_grad_obj.register_hook(reduce_grad_hook_sp)
 
-                        accum_grad_obj.register_hook(reduce_grad_hook)
+                        if self._overlap_sync_grad:
+                            accum_grad_obj.register_hook(reduce_grad_hook)
 
                     _define_and_attach(param, reduce_rank)
 
@@ -943,6 +943,14 @@ class HybridZeroOptimizer(BaseOptimizer):
         grad_scaler = states["grad_scaler"]
         self.grad_scaler.load_state_dict(grad_scaler)
         optim_states = states["base_optim_states"]
+
+        if gpc.config.get("only_load_lr", False):
+            if gpc.is_rank_for_log():
+                logger.info("Only load lr in param_groups, skip loading weights in optimizer...")
+            for pg1, pg2 in zip(self.optim.param_groups, optim_states["param_groups"]):
+                pg1["lr"] = pg2["lr"]
+            return
+
         self.optim.load_state_dict(optim_states)
 
         # load fp32 model weight.
