@@ -88,13 +88,13 @@ def revert(src, tgt, tp_size, pp_size, embed_split_hidden, adapt_hf, use_flash):
                 w3s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w2.weight"].chunk(tp_size, 1)
                 for i in range(tp_size):
                     moe_states[global_layer_i][expert_id][i][
-                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.experts.{expert_id}.w1.weight"
+                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.wrapped_experts.{expert_id}.w1.weight"
                     ] = w1s[i].clone()
                     moe_states[global_layer_i][expert_id][i][
-                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.experts.{expert_id}.w2.weight"
+                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.wrapped_experts.{expert_id}.w2.weight"
                     ] = w2s[i].clone()
                     moe_states[global_layer_i][expert_id][i][
-                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.experts.{expert_id}.w3.weight"
+                        f"model.layers.{layer_i}.feed_forward.moe_layer.experts.wrapped_experts.{expert_id}.w3.weight"
                     ] = w3s[i].clone()
     for i in range(tp_size):
         if embed_split_hidden:

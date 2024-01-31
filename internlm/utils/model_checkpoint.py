@@ -591,7 +591,7 @@ def load_model_checkpoint(folder, model):
     else:
         missing_k, unexpected_keys = model.load_state_dict(states, strict=False)
     if len(missing_k) != 0:
-        logger.warning(f"Warning: missing keys {missing_k}")
+        logger.warning(f"{gpc.get_global_rank(): }Warning: missing keys {missing_k}")
     if len(unexpected_keys) != 0:
         logger.warning(f"Warning: unexpected keys {unexpected_keys}")
 
@@ -606,7 +606,7 @@ def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
     moe_layer_id = pp_rank * pipeline_stage_size
     for n_module, module in model.named_modules():
         if isinstance(module, MoE):  # and deepspeed.comm.get_rank() == 0:
-            num_local_experts = module.num_local_experts
+            num_local_experts = module.moe_layer.num_local_experts
             expp_rank = gpc.get_local_rank(ParallelMode.EXPERT)
 
             # get all moe parameters
@@ -687,7 +687,7 @@ def try_load_moe_checkpoint(folder, model, state_dict, tp_rank, pp_rank):
     moe_layer_id = pp_rank * pipeline_stage_size
     for _, module in model.named_modules():
         if isinstance(module, MoE):  # and deepspeed.comm.get_rank() == 0:
-            num_local_experts = module.num_local_experts
+            num_local_experts = module.moe_layer.num_local_experts
             expp_rank = gpc.get_local_rank(ParallelMode.EXPERT)
             # loop all local_experts
             for local_expert_id in range(num_local_experts):
