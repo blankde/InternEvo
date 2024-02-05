@@ -15,6 +15,7 @@ from internlm.core.context import global_context as gpc
 from internlm.core.engine import Engine
 from internlm.core.naive_amp import NaiveAMPModel
 from internlm.utils.common import (
+    SchedulerHook,
     check_data_is_packed,
     get_current_device,
     move_to_device,
@@ -22,7 +23,7 @@ from internlm.utils.common import (
 from internlm.utils.logger import get_logger
 from internlm.utils.timeout import llm_timeout
 
-from .base_scheduler import BaseScheduler, SchedulerHook
+from .base_scheduler import BaseScheduler
 
 logger = get_logger(__file__)
 
@@ -140,11 +141,7 @@ class PipelineScheduler(BaseScheduler):
             tensor_shape if tensor_shape is None or isinstance(tensor_shape, torch.Size) else torch.Size(tensor_shape)
         )
 
-        self.scatter_gather_tensors = (
-            scatter_gather_tensors
-            and gpc.is_initialized(ParallelMode.TENSOR)
-            and gpc.get_world_size(ParallelMode.TENSOR) > 1
-        )
+        self.scatter_gather_tensors = scatter_gather_tensors and gpc.is_using_parallel_mode(ParallelMode.TENSOR)
 
         if gpc.config.parallel.sequence_parallel:
             self.scatter_gather_tensors = False
@@ -308,9 +305,12 @@ class PipelineScheduler(BaseScheduler):
 
         moe_loss = (
             sum(moe_losses) * gpc.config.loss.moe_loss_coeff
-            if hasattr(gpc.config.model, "num_experts")
+            if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1
             else torch.tensor(0.0, device=torch.cuda.current_device(), dtype=gpc.config.model.get("dtype"))
         )
+        # the moe_loss is computed among the "tensor" group if sequence parallel is enabled, so we need to do allreduce
+        if gpc.config.parallel.sequence_parallel:
+            dist.all_reduce(moe_loss, op=dist.ReduceOp.AVG, group=gpc.get_group(ParallelMode.TENSOR))
         moe_loss /= self.num_microbatches
         accum_moe_loss.add_(moe_loss.detach())
 
@@ -445,7 +445,9 @@ class PipelineScheduler(BaseScheduler):
                 comm.send_forward(output_obj, scatter_gather_tensors=self.scatter_gather_tensors)
 
         output, label = pack_return_tensors(return_tensors) if len(return_tensors) > 0 else (None, None)
-        dist.all_reduce(accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
+
+        if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1:
+            dist.all_reduce(accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
 
         if accum_loss is not None:
             accum_loss += accum_moe_loss
@@ -647,7 +649,9 @@ class PipelineScheduler(BaseScheduler):
                 comm.send_backward(input_obj_grad, scatter_gather_tensors=self.scatter_gather_tensors)
 
         output, label = pack_return_tensors(return_tensors) if len(return_tensors) > 0 else (None, None)
-        dist.all_reduce(accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
+
+        if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1:
+            dist.all_reduce(accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
 
         if accum_loss is not None:
             accum_loss += accum_moe_loss
@@ -855,9 +859,12 @@ class InterleavedPipelineScheduler(PipelineScheduler):
 
         moe_loss = (
             sum(moe_losses) * gpc.config.loss.moe_loss_coeff
-            if hasattr(gpc.config.model, "num_experts")
+            if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1
             else torch.tensor(0.0, device=torch.cuda.current_device(), dtype=gpc.config.model.get("dtype"))
         )
+        # the moe_loss is computed among the "tensor" group if sequence parallel is enabled, so we need to do allreduce
+        if gpc.config.parallel.sequence_parallel:
+            dist.all_reduce(moe_loss, op=dist.ReduceOp.AVG, group=gpc.get_group(ParallelMode.TENSOR))
         moe_loss /= self.num_microbatches
 
         if self._accum_moe_loss is not None:
@@ -1387,7 +1394,8 @@ class InterleavedPipelineScheduler(PipelineScheduler):
         else:
             output, label = (None, None)
 
-        dist.all_reduce(self._accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
+        if hasattr(gpc.config.model, "num_experts") and gpc.config.model.num_experts > 1:
+            dist.all_reduce(self._accum_moe_loss, group=gpc.get_group(ParallelMode.PIPELINE))
         accum_moe_loss = self._accum_moe_loss
 
         accum_loss = self._accum_loss

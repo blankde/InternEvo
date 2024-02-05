@@ -9,11 +9,9 @@
 import os
 import sys
 
-import torch  # noqa # pylint: disable=unused-import
-
-project = "InternLM"
-copyright = "2023, InternLM Team"
-author = "InternLM Team"
+project = "InternEvo"
+copyright = "2023, InternEvo Team"
+author = "InternEvo Team"
 
 with open("../../../version.txt", "r") as f:
     release = f.readline().rstrip()
@@ -80,8 +78,8 @@ html_static_path = []
 html_context = {
     "display_github": True,
     "github_user": "InternLM",
-    "github_repo": "InternLM",
-    "github_version": "main",
+    "github_repo": "InternEvo",
+    "github_version": "develop",
     "conf_py_path": "/doc/code-docs/source/",
 }
 
