@@ -85,8 +85,8 @@ def revert(src, tgt, tp_size, pp_size, embed_split_hidden, adapt_hf, use_flash):
             global_layer_i = p_i * num_layer_per_stage + layer_i
             for expert_id in range(config.num_experts):
                 w1s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w1.weight"].chunk(tp_size, 0)
-                w2s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w3.weight"].chunk(tp_size, 0)
-                w3s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w2.weight"].chunk(tp_size, 1)
+                w2s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w2.weight"].chunk(tp_size, 1)
+                w3s = hf_state[f"model.layers.{layer_i}.mlp.experts.{expert_id}.w3.weight"].chunk(tp_size, 0)
                 for i in range(tp_size):
                     moe_states[global_layer_i][expert_id][i][
                         f"model.layers.{layer_i}.feed_forward.moe_layer.experts.wrapped_experts.{expert_id}.w1.weight"
