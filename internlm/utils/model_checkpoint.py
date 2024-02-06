@@ -642,7 +642,7 @@ def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
             # get all moe parameters
             moe_state_dict = {}
             for n, p in module.state_dict().items():
-                if "expert" in n and "moe_layer.gate" not in n:
+                if "experts" in n and "gate" not in n:
                     moe_state_dict[n_module + "." + n] = p
             moe_str_prefix = ".moe_layer.experts.wrapped_experts."
             # Reorder the moe name rank, so that each checkpoint only has one expert
@@ -677,7 +677,7 @@ def get_non_moe_state_dict(full_state_dict):
     Get the state dict of the non-moe layers
     """
     for key in list(full_state_dict.keys()):
-        if "expert" in key and "moe_layer.gate" not in key:
+        if "experts" in key and "gate" not in key:
             full_state_dict.pop(key)
 
     return full_state_dict
