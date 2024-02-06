@@ -57,6 +57,8 @@ class PackedFlashBaseLayer1D(nn.Module):
         norm_type (str): Use RMS norm or layernorm."rmsnorm" by default.
         use_flash_attn (bool): Whether use flash-attn. True by default.
         rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
+        tp_mode (str): The string value of tensor parallel mode, should be in ["mtp", "msp", "fsp", "isp"],
+                "mtp" by default.
     """
 
     def __init__(

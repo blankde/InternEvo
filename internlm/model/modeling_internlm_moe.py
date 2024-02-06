@@ -11,7 +11,7 @@ from torch import nn
 
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
-from internlm.core.naive_amp import set_fp32_attr_to_module
+from internlm.core.naive_amp import set_fp32_attr_to_module, set_output_attr_to_module
 from internlm.initialize.initialize_tensor import normal_, scaled_init_method_normal
 from internlm.model.embedding import Embedding1D
 from internlm.model.linear import (
@@ -57,10 +57,10 @@ class PackedFlashBaseLayer1D(nn.Module):
         device (Optional[Union[str, torch.device]]): The device will be used.
         norm_type (str): Use RMS norm or layernorm."rmsnorm" by default.
         use_flash_attn (bool): Whether use flash-attn. True by default.
+        rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
         num_experts (int): The number of experts. <=1 means dense, >1 means MoE. 1 by default.
-        moe_use_residual (bool, optional): default=False, make this MoE layer a Residual MoE
-                                          (https://arxiv.org/abs/2201.05596) layer.
-        moe_type (str): determine which moe impl will be used, default is GShardMoE
+        tp_mode (str): The string value of tensor parallel mode, should be in ["mtp", "msp", "fsp", "isp"],
+                "mtp" by default.
     """
 
     def __init__(
@@ -85,6 +85,7 @@ class PackedFlashBaseLayer1D(nn.Module):
         use_flash_attn: bool = True,
         num_experts: int = 1,
         tp_mode: str = "mtp",
+        rope_base: int = 10000,
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -96,6 +97,7 @@ class PackedFlashBaseLayer1D(nn.Module):
         head_dim = hidden_size // num_attention_heads
         self.tp_mode = tp_mode
         parallel_mode = ParallelMode.WEIGHT if self.tp_mode == "isp" else ParallelMode.TENSOR
+
         self.mixer = MHA(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,
@@ -110,6 +112,7 @@ class PackedFlashBaseLayer1D(nn.Module):
             rotary_emb_dim=head_dim,
             rotary_emb_scale_base=0,
             use_flash_attn=use_flash_attn,
+            rope_base=rope_base,
             device=device,
             dtype=dtype,
             tp_mode=self.tp_mode,
@@ -124,7 +127,6 @@ class PackedFlashBaseLayer1D(nn.Module):
             self.norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_epsilon)
 
         self.num_experts = num_experts
-        ep_size = gpc.get_world_size(ParallelMode.EXPERT)
         if num_experts <= 1:  # dense, not MoE
             if use_swiglu:
                 mlp_cls = get_mlp_cls(self.tp_mode)
@@ -158,7 +160,7 @@ class PackedFlashBaseLayer1D(nn.Module):
                 hidden_size=hidden_size,
                 num_experts=num_experts,
                 ep_group=gpc.get_group(ParallelMode.EXPERT),
-                ep_size=ep_size,
+                ep_size=gpc.get_world_size(ParallelMode.EXPERT),
                 device=device,
                 dtype=dtype,
             )
@@ -288,10 +290,8 @@ class PackedFlashInternLm1D(nn.Module):
         residual_in_fp32 (bool): Whether to use residual in fp32. False by default.
         norm_type (str): Normalization type. Use RMSNorm or LayerNorm. "rmsnorm" by default.
         use_flash_attn (bool): Whether to use flash-attn. True by default.
+        rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
         num_experts (int): The number of experts. <=1 means dense, >1 means MoE. 1 by default.
-        moe_use_residual (bool, optional): default=False, make this MoE layer a Residual MoE
-                                          (https://arxiv.org/abs/2201.05596) layer.
-        moe_type (str): determine which moe impl will be used, default is GShardMoE
     """
 
     def __init__(
@@ -322,6 +322,7 @@ class PackedFlashInternLm1D(nn.Module):
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
         use_flash_attn: bool = True,
+        rope_base: int = 10000,
         num_experts: bool = 1,
     ):
         super().__init__()
@@ -356,6 +357,7 @@ class PackedFlashInternLm1D(nn.Module):
             for _, param in self.embedding.named_parameters():
                 normal_(std=0.0052)(param)
         self.embed_grad_scale = embed_grad_scale
+
         self.blocks = nn.ModuleList(
             [
                 PackedFlashBaseLayer1D(
@@ -379,6 +381,7 @@ class PackedFlashInternLm1D(nn.Module):
                     use_flash_attn=use_flash_attn,
                     num_experts=num_experts,
                     tp_mode=self.tp_mode,
+                    rope_base=rope_base,
                 )
                 for lid in range(num_layers)
             ]
@@ -397,6 +400,7 @@ class PackedFlashInternLm1D(nn.Module):
                 dtype=dtype,
                 weight_scale=embed_grad_scale,
             )
+            set_output_attr_to_module(self.head)
             for _, param in self.head.named_parameters():
                 normal_(std=0.0052)(param)
 
@@ -520,6 +524,7 @@ def build_model_with_moe_cfg(
     use_scaled_init: bool = True,
     use_swiglu: bool = True,
     use_flash_attn: bool = True,
+    rope_base: int = 10000,
     num_experts: int = 1,
     moe_use_residual: bool = False,  # pylint: disable=W0613
     moe_type: str = None,  # pylint: disable=W0613
@@ -553,10 +558,12 @@ def build_model_with_moe_cfg(
         use_scaled_init (bool): Whether to use scaled init. True by default.
         use_swiglu (bool): Whether to use swiglu. True by default.
         use_flash_attn (bool): Whether to use flash-attn. True by default.
+        rope_base (int): The value of `base` for rotary position embeddings. 10000 by default.
         num_experts (int): The number of experts. <=1 means dense, >1 means MoE. 1 by default.
         moe_use_residual (bool, optional): default=False, make this MoE layer a Residual MoE
                                            (https://arxiv.org/abs/2201.05596) layer.
         moe_type (str): determine which moe impl will be used, default is GShardMoE
+
     """
 
     cfg = dict(
@@ -581,6 +588,7 @@ def build_model_with_moe_cfg(
         use_scaled_init=use_scaled_init,
         use_swiglu=use_swiglu,
         use_flash_attn=use_flash_attn,
+        rope_base=rope_base,
         num_experts=num_experts,
     )
 
