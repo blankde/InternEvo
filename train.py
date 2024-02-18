@@ -271,9 +271,8 @@ def main(args):
                 grad_norm=grad_norm_groups,
                 metric=metric,
                 update_panel=uniscale_logger is not None,
-                avg_token_dropped_rate=round(gpc.moe_metric.avg_token_dropped_rate(), 4),
+                moe_metric=gpc.moe_metric,
             )
-            gpc.moe_metric.reset()
 
             timer("one-batch").stop()
 
