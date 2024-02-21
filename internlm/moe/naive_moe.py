@@ -56,8 +56,8 @@ class NaiveMOELayer(BaseMoELayer):
         scores = self.gate(x).softmax(dim=-1)
 
         expert_weights, expert_indices = torch.topk(scores, self.topk, dim=-1)
-        expert_weights = expert_weights.softmax(dim=-1)
-        flat_expert_indices = expert_indices.view(-1)
+        expert_weights /= expert_weights.sum(dim=-1, keepdim=True)
+        flat_expert_indices = expert_indices.view(-1)        
 
         x = x.repeat_interleave(self.topk, dim=0)
         y = torch.empty_like(x)
