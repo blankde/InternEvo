@@ -89,14 +89,14 @@ class MLP(nn.Module):
         super().__init__()
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
-        # self.w1 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        # self.w2 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        # self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
+        self.w1 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
+        self.w2 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
+        self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
 
 
-        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).view(num_local_experts, hidden_features, in_features).contiguous())
+        # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).view(num_local_experts, hidden_features, in_features).contiguous())
 
         # rank = gpc.get_local_rank(ParallelMode.EXPERT)
         # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
@@ -136,13 +136,14 @@ class MixtralMoE(BaseMoELayer):
         top_k,
         device=None,
         dtype=None,
+        multiple_of=256
     ) -> None:
         assert not gpc.config.parallel.sequence_parallel, "do not support sequence parallel"
         self.top_k = top_k
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio)
+        self.ffn_dim = multiple_of * ((int(hidden_size * gpc.config.model.mlp_ratio) + multiple_of - 1) // multiple_of)
         self.moe_capacity_factor = 1
         assert self.ffn_dim % tp_size == 0
         super().__init__(
@@ -173,9 +174,9 @@ class MixtralMoE(BaseMoELayer):
         # re-init the number of experts in each device
         # self.num_local_experts = num_experts // ep_size
 
-    def expert_capacity(self, tokens):
+    def expert_capacity(self, tokens, top_k):
         world_size = gpc.get_world_size(ParallelMode.EXPERT)  # mpu.get_expert_parallel_world_size(self.args)
-        tokens_per_expert = self.top_k * tokens * world_size / self.num_experts
+        tokens_per_expert = top_k * tokens * world_size / self.num_experts
         return int(self.moe_capacity_factor * tokens_per_expert)
 
     def indices_and_bins(self, top_expert):
@@ -227,9 +228,9 @@ class MixtralMoE(BaseMoELayer):
             # If expert_capacity is set to zero, set the number of tokens
             # per expert to the maximum we need to avoid dropping tokens.
             tokens, hs = x.size()
-            expert_capacity = self.expert_capacity(tokens)
-            #if expert_capacity == 0:
-            expert_capacity = torch.max(tokens_per_expert).item()
+            expert_capacity = self.expert_capacity(tokens, top_k=self.top_k)
+            if expert_capacity == 0:
+                expert_capacity = torch.max(tokens_per_expert).item()
 
         out = self.permute_and_compute(
             x,
@@ -242,8 +243,8 @@ class MixtralMoE(BaseMoELayer):
             top_k=self.top_k
         )
 
-        if gpc.is_rank_for_log():
-            print(out, flush=True)
+        # if gpc.is_rank_for_log():
+        #     print(out, flush=True)
         return out
 
     def _parallel_forward(self, *inputs):
@@ -377,9 +378,9 @@ class MixtralMoE(BaseMoELayer):
             # If expert_capacity is set to zero, set the number of tokens
             # per expert to the maximum we need to avoid dropping tokens.
             tokens, hs = x.size()
-            expert_capacity = self.expert_capacity(tokens)
-            #if expert_capacity == 0:
-            expert_capacity = torch.max(parallel_tokens_per_expert).item()
+            expert_capacity = self.expert_capacity(tokens, top_k=1)
+            if expert_capacity == 0:
+                expert_capacity = torch.max(parallel_tokens_per_expert).item()
 
         # Locally permute the tokens and perform the expert computation.
         # Block to make sure that the cross-device permutation is complete.
@@ -406,8 +407,8 @@ class MixtralMoE(BaseMoELayer):
 
         # Un-permute locally to setup for the next series of operations.
         x = ops.scatter(x, indices, bin_ids, expert_weights, bins, self.top_k, self.quantize_scatter_num_bits)
-        if gpc.is_rank_for_log():
-            print(x, flush=True)
+        # if gpc.is_rank_for_log():
+        #     print(x, flush=True)
         return x
     
     def permute_and_compute(

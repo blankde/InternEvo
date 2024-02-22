@@ -352,17 +352,17 @@ class MegaBlockFeedForward(nn.Module):
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
 
-        # self.w1 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
-        # self.w2 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
-        # self.w3 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        self.w1 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        self.w2 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        self.w3 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
 
         # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).contiguous())
         # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).contiguous())
         # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).contiguous())
-        rank = gpc.get_local_rank(ParallelMode.EXPERT)
-        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].contiguous())
-        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].contiguous())
-        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].contiguous())
+        # rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].contiguous())
+        # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].contiguous())
+        # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].contiguous())
         self.parallel_mode = parallel_mode
 
     def forward(self, x, topo):
@@ -398,13 +398,14 @@ class MixtraldMoE(BaseMoELayer):
         parallel_mode="tensor",
         device=None,
         dtype=None,
+        multiple_of=256
     ) -> None:
         # assert gpc.expert_parallel_size == 1, "do not support expert parallel"
         self.top_k = top_k
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio)
+        self.ffn_dim = multiple_of * ((int(hidden_size * gpc.config.model.mlp_ratio) + multiple_of - 1) // multiple_of)
         self.moe_capacity_factor = 1
         assert self.ffn_dim % tp_size == 0
         if parallel_mode == "tensor":
@@ -618,8 +619,8 @@ class MixtraldMoE(BaseMoELayer):
             self.top_k,
             self.quantize_scatter_num_bits,
         )
-        if gpc.is_rank_for_log():
-            print(x.view(*input_shape), flush=True)
+        # if gpc.is_rank_for_log():
+        #     print(x.view(*input_shape), flush=True)
         return x.view(*input_shape)
 
     def _parallel_forward(self, *inputs):
