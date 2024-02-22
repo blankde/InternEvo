@@ -65,4 +65,7 @@ class NaiveMOELayer(BaseMoELayer):
             y[flat_expert_indices == i] = expert(x[flat_expert_indices == i])
         y = (y.view(*expert_weights.shape, -1) * expert_weights.unsqueeze(-1)).sum(dim=1)
 
+        if gpc.is_rank_for_log():
+            print(y.view(*orig_shape), flush=True)
+
         return y.view(*orig_shape)

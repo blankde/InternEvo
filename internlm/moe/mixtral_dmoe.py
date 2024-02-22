@@ -351,14 +351,18 @@ class MegaBlockFeedForward(nn.Module):
         super().__init__()
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
-        self.w1 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+
+        # self.w1 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        # self.w2 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        # self.w3 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
 
         # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).contiguous())
         # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).contiguous())
         # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).contiguous())
-
+        rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].contiguous())
+        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].contiguous())
+        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].contiguous())
         self.parallel_mode = parallel_mode
 
     def forward(self, x, topo):
@@ -400,18 +404,18 @@ class MixtraldMoE(BaseMoELayer):
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio) // ep_size
+        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio)
         self.moe_capacity_factor = 1
         assert self.ffn_dim % tp_size == 0
         if parallel_mode == "tensor":
-            self.ffn_dim_per_row = self.ffn_dim // tp_size
+            self.ffn_dim_per_row = self.ffn_dim // tp_size //ep_size
         else:
-            self.ffn_dim_per_row = self.ffn_dim
+            self.ffn_dim_per_row = self.ffn_dim //ep_size
         super().__init__(
             torch.nn.Linear(hidden_size, num_experts, bias=False),
             MegaBlockFeedForward(
                 hidden_size,
-                self.ffn_dim * num_experts // tp_size,
+                (self.ffn_dim // tp_size) * (num_experts // ep_size),
                 parallel_mode,
                 device,
                 dtype,
@@ -429,7 +433,7 @@ class MixtraldMoE(BaseMoELayer):
 
         # Calculate the number of bits needed to represent the column indices
         # in the intermediate sparse matrix.
-        max_column_index = (self.ffn_dim * self.num_experts) // self.blocking
+        max_column_index = (self.ffn_dim * (self.num_experts // ep_size)) // self.blocking
         self.transpose_sort_end_bit = max(int(np.ceil(np.log2(max_column_index))), 1)
 
         # re-init the number of experts in each device
@@ -614,7 +618,8 @@ class MixtraldMoE(BaseMoELayer):
             self.top_k,
             self.quantize_scatter_num_bits,
         )
-
+        if gpc.is_rank_for_log():
+            print(x.view(*input_shape), flush=True)
         return x.view(*input_shape)
 
     def _parallel_forward(self, *inputs):
@@ -779,6 +784,8 @@ class MixtraldMoE(BaseMoELayer):
 
         # Un-permute locally to setup for the next series of operations.
         x = ops.scatter(x, indices, bin_ids, expert_weights, bins, self.top_k, self.quantize_scatter_num_bits)
+        if gpc.is_rank_for_log():
+            print(x.view(*input_shape), flush=True)
         return x.view(*input_shape)
 
     # For use in the base-class parallel_forward_once.

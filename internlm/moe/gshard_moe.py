@@ -231,7 +231,7 @@ def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tup
 
     # Create a mask for 2nd's expert per token using Gumbel-max trick
     # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
-    logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
+    logits_w_noise = logits#  + gumbel_rsample(logits.shape, device=logits.device)
     # Replace top-expert with min value
     logits_except1 = logits_w_noise.masked_fill(mask1.bool(), torch.finfo(logits.dtype).min)
     indices2_s = torch.argmax(logits_except1, dim=1)
@@ -436,7 +436,15 @@ class GShardMOELayer(BaseMoELayer):
             ep_size,
             num_experts // ep_size,
         )
-
+        rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        self.experts.wrapped_experts[0].w1.weight = torch.nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
+        self.experts.wrapped_experts[0].w2.weight = torch.nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
+        self.experts.wrapped_experts[0].w3.weight = torch.nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).transpose(-2,-1).contiguous())
+        for expert in self.experts.wrapped_experts:
+            # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
+            for _, param in expert.named_parameters():
+                param.is_expert = True
+                param.group_name = f"moe_ep_size_{ep_size}"
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
@@ -446,7 +454,6 @@ class GShardMOELayer(BaseMoELayer):
 
         if self.wall_clock_breakdown:
             timer("moe").start()
-
         # Implement Algorithm 2 from GShard paper.
         d_model = inputs[0].shape[-1]
 
@@ -495,5 +502,7 @@ class GShardMOELayer(BaseMoELayer):
         if self.wall_clock_breakdown:
             timer("moe").stop()
             self.time_moe = timer("moe").elapsed(reset=False)
+        if gpc.is_rank_for_log():
+            print(out, flush=True)
 
         return out

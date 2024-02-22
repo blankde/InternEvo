@@ -166,7 +166,7 @@ class PackedFlashBaseLayer1D(nn.Module):
         self.use_scaled_init = use_scaled_init
         self.residual_in_fp32 = residual_in_fp32  # only make sense when using prenorm
         self.return_residual = False
-        self.reset_parameters()  # TODO: check this should be changed when moe is added
+        #self.reset_parameters()  # TODO: check this should be changed when moe is added
 
     def reset_parameters(self):
         with torch.no_grad():

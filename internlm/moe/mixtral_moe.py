@@ -89,13 +89,19 @@ class MLP(nn.Module):
         super().__init__()
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
-        self.w1 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
+        # self.w1 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
+        # self.w2 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
+        # self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
+
 
         # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
         # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
         # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).view(num_local_experts, hidden_features, in_features).contiguous())
+
+        rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).contiguous())
 
     def forward(self, x):
         #TODO w2 and w3 should swap
@@ -132,12 +138,11 @@ class MixtralMoE(BaseMoELayer):
         dtype=None,
     ) -> None:
         assert not gpc.config.parallel.sequence_parallel, "do not support sequence parallel"
-        assert gpc.config.parallel["tensor"].get("mode", "mtp") != "isp", "do not support weight parallel"
         self.top_k = top_k
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio) // ep_size
+        self.ffn_dim = int(hidden_size * gpc.config.model.mlp_ratio)
         self.moe_capacity_factor = 1
         assert self.ffn_dim % tp_size == 0
         super().__init__(
@@ -237,8 +242,8 @@ class MixtralMoE(BaseMoELayer):
             top_k=self.top_k
         )
 
-        # print(out, flush=True)
-        # exit(-1)
+        if gpc.is_rank_for_log():
+            print(out, flush=True)
         return out
 
     def _parallel_forward(self, *inputs):
@@ -401,8 +406,8 @@ class MixtralMoE(BaseMoELayer):
 
         # Un-permute locally to setup for the next series of operations.
         x = ops.scatter(x, indices, bin_ids, expert_weights, bins, self.top_k, self.quantize_scatter_num_bits)
-        # print(x, flush=True)
-        # exit(-1)
+        if gpc.is_rank_for_log():
+            print(x, flush=True)
         return x
     
     def permute_and_compute(

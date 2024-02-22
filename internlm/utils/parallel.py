@@ -28,9 +28,10 @@ def sync_model_param(model):
             gpc.is_initialized(ParallelMode.EXPERT_DATA) and gpc.get_world_size(ParallelMode.EXPERT_DATA) > 1
         )
         for param in model.parameters():
-            if sync_moe_param and getattr(param, "is_expert", False):
-                ranks = gpc.get_ranks_in_group(ParallelMode.EXPERT_DATA)
-                dist.broadcast(param, src=ranks[0], group=gpc.get_group(ParallelMode.EXPERT_DATA))
+            if getattr(param, "is_expert", False):
+                if sync_moe_param:
+                    ranks = gpc.get_ranks_in_group(ParallelMode.EXPERT_DATA)
+                    dist.broadcast(param, src=ranks[0], group=gpc.get_group(ParallelMode.EXPERT_DATA))
             else:
                 ranks = gpc.get_ranks_in_group(ParallelMode.DATA)
                 dist.broadcast(param, src=ranks[0], group=gpc.get_group(ParallelMode.DATA))
