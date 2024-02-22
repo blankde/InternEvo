@@ -501,7 +501,7 @@ class ParallelContext(metaclass=SingletonMeta):
         # by default, expert_parallel_size equals to data_parallel_size, but if the number of experts is smaller
         # than data_parallel_size, set expert_parallel_size to be the number of experts to make sure each device
         # has one expert.
-        self.expert_parallel_size = min(self.data_parallel_size, self.config.model.get("num_experts", 1))
+        self.expert_parallel_size = 1
 
         self.check_sanity()
 

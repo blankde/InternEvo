@@ -94,14 +94,14 @@ class MLP(nn.Module):
         # self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
 
 
-        # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).view(num_local_experts, hidden_features, in_features).contiguous())
+        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).view(num_local_experts, hidden_features, in_features).contiguous())
 
-        rank = gpc.get_local_rank(ParallelMode.EXPERT)
-        self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
-        self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).contiguous())
+        # rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        # self.w1 = nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        # self.w2 = nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).transpose(1,2).contiguous())
+        # self.w3 = nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(num_local_experts, hidden_features, in_features).contiguous())
 
     def forward(self, x):
         #TODO w2 and w3 should swap
@@ -228,8 +228,8 @@ class MixtralMoE(BaseMoELayer):
             # per expert to the maximum we need to avoid dropping tokens.
             tokens, hs = x.size()
             expert_capacity = self.expert_capacity(tokens)
-            if expert_capacity == 0:
-                expert_capacity = torch.max(tokens_per_expert).item()
+            #if expert_capacity == 0:
+            expert_capacity = torch.max(tokens_per_expert).item()
 
         out = self.permute_and_compute(
             x,
