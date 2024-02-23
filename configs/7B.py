@@ -2,11 +2,11 @@ JOB_NAME = "7b_moe_train"
 DO_ALERT = False
 
 SEQ_LEN = 2048
-HIDDEN_SIZE = 2048
-NUM_ATTENTION_HEAD = 16
-MLP_RATIO = 4
-NUM_LAYER = 24
-VOCAB_SIZE = 92544
+HIDDEN_SIZE = 4096
+NUM_ATTENTION_HEAD = 32
+MLP_RATIO = 4 / 3
+NUM_LAYER = 32
+VOCAB_SIZE = 103168
 
 MODEL_ONLY_FOLDER = "local:llm_ckpts/xxxx"
 # Ckpt folder format:
@@ -141,9 +141,9 @@ model = dict(
     layer_norm_epsilon=1e-5,
     use_flash_attn=True,
     num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
-    num_experts=4,
+    num_experts=1,
     moe_use_residual=False,
-    moe_type="Mixtral",  # moe_type can be "Naive", "GShard", "Mixtral", "Mixtral-DMOE"
+    moe_type="GShard",  # moe_type can be "Naive", "GShard", "Mixtral"
 )
 
 # zero1 parallel:
@@ -184,8 +184,8 @@ monitor = dict(
 #     eval_capacity_factor=1.0,
 #     min_capacity=4,
 #     noisy_gate_policy=None,
-#     drop_tokens=False,
-#     use_rts=False,
+#     drop_tokens=True,
+#     use_rts=True,
 # )
 
 # Naive MoE config
@@ -204,6 +204,7 @@ model_type = "INTERNLM_MoE"
 # metric_dtype can be "fp32" or other string
 # only when set to "fp32" will use fp32 to calc in metrics
 # metric_dtype = "fp32"
+
 
 import os
 os.environ["TRITON_CACHE_MANAGER"] = 'triton_cache_manager:ModifiedCacheManager'

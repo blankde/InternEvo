@@ -436,15 +436,15 @@ class GShardMOELayer(BaseMoELayer):
             ep_size,
             num_experts // ep_size,
         )
-        rank = gpc.get_local_rank(ParallelMode.EXPERT)
-        self.experts.wrapped_experts[0].w1.weight = torch.nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
-        self.experts.wrapped_experts[0].w2.weight = torch.nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
-        self.experts.wrapped_experts[0].w3.weight = torch.nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).transpose(-2,-1).contiguous())
-        for expert in self.experts.wrapped_experts:
-            # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
-            for _, param in expert.named_parameters():
-                param.is_expert = True
-                param.group_name = f"moe_ep_size_{ep_size}"
+        # rank = gpc.get_local_rank(ParallelMode.EXPERT)
+        # self.experts.wrapped_experts[0].w1.weight = torch.nn.Parameter(torch.load("w1.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
+        # self.experts.wrapped_experts[0].w2.weight = torch.nn.Parameter(torch.load("w2.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).contiguous())
+        # self.experts.wrapped_experts[0].w3.weight = torch.nn.Parameter(torch.load("w3.pt").to(device).chunk(4)[rank].view(int(hidden_size * gpc.config.model.mlp_ratio), hidden_size).transpose(-2,-1).contiguous())
+        # for expert in self.experts.wrapped_experts:
+        #     # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
+        #     for _, param in expert.named_parameters():
+        #         param.is_expert = True
+        #         param.group_name = f"moe_ep_size_{ep_size}"
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
@@ -502,7 +502,7 @@ class GShardMOELayer(BaseMoELayer):
         if self.wall_clock_breakdown:
             timer("moe").stop()
             self.time_moe = timer("moe").elapsed(reset=False)
-        if gpc.is_rank_for_log():
-            print(out, flush=True)
+        # if gpc.is_rank_for_log():
+        #     print(out, flush=True)
 
         return out
