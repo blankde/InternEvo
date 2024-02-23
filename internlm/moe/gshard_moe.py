@@ -217,67 +217,80 @@ def top1gating(
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
-def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+def top2gating(
+    logits: Tensor,
+    capacity_factor: float,
+    min_capacity: int,
+    noisy_gate_policy: Optional[str] = None,
+    drop_tokens: bool = True,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top2Gating on logits."""
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
-
-    capacity = _capacity(gates, torch.tensor(capacity_factor * 2), torch.tensor(min_capacity))
-
-    # Create a mask for 1st's expert per token
-    indices1_s = torch.argmax(gates, dim=1)
     num_experts = int(gates.shape[1])
-    mask1 = F.one_hot(indices1_s, num_classes=num_experts)
 
-    # Create a mask for 2nd's expert per token using Gumbel-max trick
-    # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
-    logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
-    # Replace top-expert with min value
-    logits_except1 = logits_w_noise.masked_fill(mask1.bool(), torch.finfo(logits.dtype).min)
-    indices2_s = torch.argmax(logits_except1, dim=1)
-    mask2 = F.one_hot(indices2_s, num_classes=num_experts)
+    # NOTE: here we just add noise on 2nd expert, following
+    # https://github.com/facebookresearch/fairscale/blob/main/fairscale/nn/moe/top2gate.py
+    if noisy_gate_policy == "RSample":
+        # Create a mask for 1st's expert per token
+        indices1_s = torch.argmax(gates, dim=1)
+        mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+        # Create a mask for 2nd's expert per token using Gumbel-max trick
+        # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
+        logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
+        # Replace top-expert with min value
+        logits_except1 = logits_w_noise.masked_fill(mask1.bool(), torch.finfo(logits.dtype).min)
+        indices2_s = torch.argmax(logits_except1, dim=1)
+        mask2 = F.one_hot(indices2_s, num_classes=num_experts)
+        # merge operands in topk gating to save launch overhead
+        masks = torch.cat((mask1, mask2), dim=0)
+    else:
+        # Create a mask by top-2 experts
+        indices_s = torch.topk(gates, 2, dim=1).indices
+        indices_s = indices_s.permute(1, 0).reshape(-1)
+        masks = F.one_hot(indices_s, num_classes=num_experts)
 
     # Compute locations in capacity buffer
-    locations1 = torch.cumsum(mask1, dim=0) - 1
-    locations2 = torch.cumsum(mask2, dim=0) - 1
-    # Update 2nd's location by accounting for locations of 1st
-    locations2 += torch.sum(mask1, dim=0, keepdim=True)
+    locations = torch.cumsum(masks, dim=0) - 1
+
+    # reshape (s,e) to (k,s,e)
+    masks = masks.reshape(-1, gates.shape[0], num_experts)
+    locations = locations.reshape(-1, gates.shape[0], num_experts)
 
     # gating decisions
-    exp_counts = torch.sum(mask1, dim=0).detach().to("cpu")
+    exp_counts = torch.sum(masks[0], dim=0).detach().to("cpu")
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
-    ce = torch.mean(mask1.type_as(logits), dim=0)
+    ce = torch.mean(masks[0].type_as(logits), dim=0)
     l_aux = torch.mean(me * ce) * num_experts * num_experts
 
+    capacity = _capacity(gates, torch.tensor(capacity_factor * 2), torch.tensor(min_capacity))
+    # if we don't want to drop any tokens
+    if not drop_tokens:
+        new_capacity = torch.max(exp_counts).to(logits.device)
+        dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=gpc.get_group(ParallelMode.GLOBAL))
+        capacity = new_capacity
     # Remove locations outside capacity from mask
-    mask1 *= torch.lt(locations1, capacity)
-    mask2 *= torch.lt(locations2, capacity)
+    masks *= torch.lt(locations, capacity)
 
     # Store the capacity location for each token
-    locations1_s = torch.sum(locations1 * mask1, dim=1)
-    locations2_s = torch.sum(locations2 * mask2, dim=1)
+    locations_s = torch.sum(locations * masks, dim=2)
 
     # Normalize gate probabilities
-    mask1_float = mask1.type_as(logits)
-    mask2_float = mask2.type_as(logits)
-    gates1_s = einsum("se,se->s", gates, mask1_float)
-    gates2_s = einsum("se,se->s", gates, mask2_float)
-    denom_s = gates1_s + gates2_s
+    mask_float = masks.type_as(logits)
+    gate_s = einsum("se,kse->ks", gates, mask_float)
+    denom_s = torch.sum(gate_s, dim=0)
     # Avoid divide-by-zero
     denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
-    gates1_s /= denom_s
-    gates2_s /= denom_s
+    gate_s /= denom_s
 
     # Calculate combine_weights and dispatch_mask
-    gates1 = einsum("s,se->se", gates1_s, mask1_float)
-    gates2 = einsum("s,se->se", gates2_s, mask2_float)
-    locations1_sc = F.one_hot(locations1_s, num_classes=capacity).type_as(logits)
-    locations2_sc = F.one_hot(locations2_s, num_classes=capacity).type_as(logits)
-    combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
-    combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
-    combine_weights = combine1_sec + combine2_sec
+    gate_all = einsum("ks,kse->kse", gate_s, mask_float)
+    locations_sc = F.one_hot(locations_s, num_classes=capacity).type_as(logits)
+    combine_sec = einsum("kse,ksc->ksec", gate_all, locations_sc)
+    combine_weights = torch.sum(combine_sec, dim=0)
     dispatch_mask = combine_weights.bool()
 
     return l_aux, combine_weights, dispatch_mask, exp_counts
