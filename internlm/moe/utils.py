@@ -61,3 +61,49 @@ class AllToAll(torch.autograd.Function):
 
 def all_to_all(x, output_split_sizes=None, input_split_sizes=None, group=None, async_op=False):
     return AllToAll.apply(x, output_split_sizes, input_split_sizes, group, async_op)
+
+
+class moe_stream_acquire(torch.autograd.Function):
+    """
+    switch to stream
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        stream,
+        event,
+    ):
+        ctx.origin_stream = torch.cuda.current_stream()
+        ctx.event = event
+        event.wait(stream)
+        torch.cuda.set_stream(stream)
+
+    @staticmethod
+    def backward(ctx: Any):
+        ctx.event.record(ctx.origin_stream)
+        torch.cuda.set_stream(ctx.origin_stream)
+        return None, None
+
+
+class moe_stream_release(torch.autograd.Function):
+    """
+    switch back to stream
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        stream,
+        event,
+    ) -> Tensor:  # type: ignore
+        ctx.origin_stream = stream
+        ctx.event = event
+        event.record(stream)
+        torch.cuda.set_stream(torch.cuda.default_stream())
+
+    @staticmethod
+    def backward(ctx: Any):
+        ctx.event.wait(ctx.origin_stream)
+        torch.cuda.set_stream(ctx.origin_stream)
+        return None, None

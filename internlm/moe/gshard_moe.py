@@ -20,7 +20,7 @@ from internlm.utils.megatron_timers import megatron_timer as timer
 from internlm.utils.registry import MODEL_INITIALIZER
 
 from .base_moe import BaseMoELayer
-from .utils import all_to_all
+from .forward_func import einsum, no_overlap_moe_forward, overlap_moe_forward
 
 # global llm logger
 logger = get_logger(__file__)
@@ -62,49 +62,6 @@ def gumbel_rsample(shape: Tuple, device: torch.device) -> Tensor:
         gumbel = torch.distributions.gumbel.Gumbel(zero, one).rsample  # type: ignore
         gumbel_map[device] = gumbel
     return gumbel(shape)
-
-
-# einsum rewrites are on par or more performant
-# switch can be bubbled up in future
-USE_EINSUM = True
-
-
-# einsum dimensions: (g)roup, (s)equence, (e)xpert, (m)odel, (c)apacity
-# See https://arxiv.org/pdf/2006.16668.pdf for details.
-def einsum(rule, a, b):
-    if USE_EINSUM:
-        return torch.einsum(rule, a, b)
-    elif rule == "s,se->se":
-        # [1, s] * [s, e]
-        return a.reshape(a.shape[0], -1) * b
-    elif rule == "se,sc->sec":
-        # [s,e,1] * [s,1,c]
-        return a.unsqueeze(2) * b.unsqueeze(1)
-    elif rule == "se,se->s":
-        # [s,1,e] * [s,e,1]
-        return torch.bmm(a.unsqueeze(1), b.unsqueeze(2)).reshape(-1)
-    elif rule == "sec,sm->ecm":
-        # [e*c, s] * [s, m]
-        s = a.shape[0]
-        e = a.shape[1]
-        c = a.shape[2]
-        m = b.shape[1]
-        return torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
-    elif rule == "sec,ecm->sm":
-        # [s, e*c] * [e*c, m]
-        return torch.matmul(a.reshape(a.shape[0], -1), b.reshape(-1, b.shape[-1]))
-    elif rule == "ks,ksm->sm":
-        k = b.shape[0]
-        s = b.shape[1]
-        m = b.shape[2]
-        # [k, s] -> [s, k] -> [s, 1, k]
-        a = a.t().unsqueeze(1)
-        # [k,s,m] -> [k, sm] -> [sm, k] -> [s, m, k]
-        b = b.reshape(k, -1).t().reshape(s, m, k)
-        # bmm([s, 1, k], [s, m, k]^t) -> [s, m, 1]
-        return torch.bmm(a, b.transpose(1, 2)).squeeze(2)
-    else:
-        return torch.einsum(rule, a, b)
 
 
 # The following functions are extracted and scripted
@@ -409,6 +366,7 @@ class GShardMOELayer(BaseMoELayer):
         noisy_gate_policy: str = None,
         drop_tokens: bool = True,
         use_rts: bool = True,
+        overlap_degree=1,
         device=None,
         dtype=None,
     ) -> None:
@@ -449,15 +407,14 @@ class GShardMOELayer(BaseMoELayer):
             num_experts // ep_size,
         )
 
+        self.overlap_degree = overlap_degree
+
         self.time_falltoall = 0.0
         self.time_salltoall = 0.0
         self.time_moe = 0.0
         self.wall_clock_breakdown = False
 
     def forward(self, *inputs: Tensor) -> Tensor:
-        if self.wall_clock_breakdown:
-            timer("moe").start()
-
         # Implement Algorithm 2 from GShard paper.
         d_model = inputs[0].shape[-1]
 
@@ -466,45 +423,37 @@ class GShardMOELayer(BaseMoELayer):
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_inputs = inputs[0].reshape(-1, d_model)
 
-        self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_inputs, inputs[1])
-        dispatched_inputs = einsum(
-            "sec,sm->ecm", dispatch_mask.type_as(inputs[0]), reshaped_inputs
-        )  # TODO: heavy memory usage due to long sequence length
+        if self.overlap_degree > 1:
+            combined_output, self.l_aux, self.exp_counts = overlap_moe_forward(
+                reshaped_inputs,
+                self.gate,
+                self.experts,
+                self.overlap_degree,
+                self.ep_group,
+                self.ep_size,
+                self.num_local_experts,
+                d_model,
+            )
+        else:
+            self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_inputs, inputs[1])
+            dispatched_inputs = einsum(
+                "sec,sm->ecm", dispatch_mask.type_as(inputs[0]), reshaped_inputs
+            )  # TODO: heavy memory usage due to long sequence length
 
-        if self.wall_clock_breakdown:
-            timer("falltoall").start()
+            if self.overlap_degree == 1:
+                expert_output = no_overlap_moe_forward(
+                    dispatched_inputs, self.experts, self.ep_group, self.ep_size, self.num_local_experts, d_model
+                )
+            else:
+                assert False, "unsupported moe forward strategy"
 
-        if gpc.get_world_size(ParallelMode.EXPERT) > 1:
-            dispatched_inputs, _ = all_to_all(dispatched_inputs, group=self.ep_group)
+            # Re-shape back: gecm -> ecm
+            expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
 
-        if self.wall_clock_breakdown:
-            timer("falltoall").stop()
-            self.time_falltoall = timer("falltoall").elapsed(reset=False)
-
-        # Re-shape after all-to-all: ecm -> gecm
-        dispatched_inputs = dispatched_inputs.reshape(self.ep_size, self.num_local_experts, -1, d_model)
-
-        expert_output = self.experts(dispatched_inputs)
-
-        if self.wall_clock_breakdown:
-            timer("salltoall").start()
-
-        if gpc.get_world_size(ParallelMode.EXPERT) > 1:
-            expert_output, _ = all_to_all(expert_output, group=self.ep_group)
-
-        if self.wall_clock_breakdown:
-            timer("salltoall").stop()
-            self.time_salltoall = timer("salltoall").elapsed(reset=False)
-
-        # Re-shape back: gecm -> ecm
-        expert_output = expert_output.reshape(self.ep_size * self.num_local_experts, -1, d_model)
-
-        combined_output = einsum("sec,ecm->sm", combine_weights.type_as(inputs[0]), expert_output)
+            combined_output = einsum(
+                "sec,ecm->sm", combine_weights.type_as(inputs[0]), expert_output.type_as(inputs[0])
+            )
 
         out = combined_output.reshape(inputs[0].shape)
-
-        if self.wall_clock_breakdown:
-            timer("moe").stop()
-            self.time_moe = timer("moe").elapsed(reset=False)
 
         return out

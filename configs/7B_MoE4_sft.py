@@ -208,6 +208,7 @@ moe = dict(
     noisy_gate_policy=None,
     drop_tokens=True,
     use_rts=True,
+    overlap_degree=2,
 )
 
 model_type = "INTERNLM_MoE"
