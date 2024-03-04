@@ -174,7 +174,73 @@ def top1gating(
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
-def top2gating(
+def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Implements Top2Gating on logits."""
+    # everything is in fp32 in this function
+    gates = F.softmax(logits, dim=1)
+
+    capacity = _capacity(gates, torch.tensor(capacity_factor * 2), torch.tensor(min_capacity))
+
+    # Create a mask for 1st's expert per token
+    indices1_s = torch.argmax(gates, dim=1)
+    num_experts = int(gates.shape[1])
+    mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+    # Create a mask for 2nd's expert per token using Gumbel-max trick
+    # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
+    logits_w_noise = logits + gumbel_rsample(logits.shape, device=logits.device)
+    # Replace top-expert with min value
+    logits_except1 = logits_w_noise.masked_fill(mask1.bool(), torch.finfo(logits.dtype).min)
+    indices2_s = torch.argmax(logits_except1, dim=1)
+    mask2 = F.one_hot(indices2_s, num_classes=num_experts)
+
+    # Compute locations in capacity buffer
+    locations1 = torch.cumsum(mask1, dim=0) - 1
+    locations2 = torch.cumsum(mask2, dim=0) - 1
+    # Update 2nd's location by accounting for locations of 1st
+    locations2 += torch.sum(mask1, dim=0, keepdim=True)
+
+    # gating decisions
+    exp_counts = torch.sum(mask1, dim=0).detach().to("cpu")
+
+    # Compute l_aux
+    me = torch.mean(gates, dim=0)
+    ce = torch.mean(mask1.type_as(logits), dim=0)
+    l_aux = torch.mean(me * ce) * num_experts * num_experts
+
+    # Remove locations outside capacity from mask
+    mask1 *= torch.lt(locations1, capacity)
+    mask2 *= torch.lt(locations2, capacity)
+
+    # Store the capacity location for each token
+    locations1_s = torch.sum(locations1 * mask1, dim=1)
+    locations2_s = torch.sum(locations2 * mask2, dim=1)
+
+    # Normalize gate probabilities
+    mask1_float = mask1.type_as(logits)
+    mask2_float = mask2.type_as(logits)
+    gates1_s = einsum("se,se->s", gates, mask1_float)
+    gates2_s = einsum("se,se->s", gates, mask2_float)
+    denom_s = gates1_s + gates2_s
+    # Avoid divide-by-zero
+    denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
+    gates1_s /= denom_s
+    gates2_s /= denom_s
+
+    # Calculate combine_weights and dispatch_mask
+    gates1 = einsum("s,se->se", gates1_s, mask1_float)
+    gates2 = einsum("s,se->se", gates2_s, mask2_float)
+    locations1_sc = F.one_hot(locations1_s, num_classes=capacity).type_as(logits)
+    locations2_sc = F.one_hot(locations2_s, num_classes=capacity).type_as(logits)
+    combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
+    combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
+    combine_weights = combine1_sec + combine2_sec
+    dispatch_mask = combine_weights.bool()
+
+    return l_aux, combine_weights, dispatch_mask, exp_counts
+
+
+def fused_top2gating(
     logits: Tensor,
     capacity_factor: float,
     min_capacity: int,
@@ -282,6 +348,7 @@ class TopKGate(Module):
         noisy_gate_policy: Optional[str] = None,
         drop_tokens: bool = True,
         use_rts: bool = True,
+        optim_topkgating=True,
     ) -> None:
         super().__init__()
 
@@ -299,6 +366,7 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
+        self.optim_topkgating = optim_topkgating
 
     def forward(
         self, inputs: torch.Tensor, used_token: torch.Tensor = None
@@ -322,10 +390,17 @@ class TopKGate(Module):
                 self.use_rts,
             )
 
+        elif self.k == 2:
+            if self.optim_topkgating:
+                gate_output = fused_top2gating(
+                    logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
+                )
+            else:
+                gate_output = top2gating(
+                    logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
+                )
         else:
-            gate_output = top2gating(
-                logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
-            )
+            assert False, "unsupported gating"
 
         if self.wall_clock_breakdown:
             timer("TopKGate").stop()
@@ -367,6 +442,7 @@ class GShardMOELayer(BaseMoELayer):
         drop_tokens: bool = True,
         use_rts: bool = True,
         overlap_degree=1,
+        optim_topkgating=True,
         device=None,
         dtype=None,
     ) -> None:
@@ -387,6 +463,7 @@ class GShardMOELayer(BaseMoELayer):
                 noisy_gate_policy,
                 drop_tokens,
                 use_rts,
+                optim_topkgating,
             ),
             torch.nn.ModuleList(
                 [

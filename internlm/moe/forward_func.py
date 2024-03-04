@@ -64,7 +64,7 @@ def no_overlap_moe_forward(inputs, expert_fn, ep_group, ep_size, num_local_exper
 
 
 def overlap_moe_forward(
-    reshaped_inputs, gata_fn, expert_fn, a2a_ffn_overlap_degree, ep_group, ep_size, num_local_experts, d_model
+    reshaped_inputs, gate_fn, expert_fn, a2a_ffn_overlap_degree, ep_group, ep_size, num_local_experts, d_model
 ):
     """
     Split the input based on a2a_ffn_overlap_degree and then execute the alltoall and experts function
@@ -96,7 +96,7 @@ def overlap_moe_forward(
         moe_stream_release.apply(torch.cuda.default_stream(), ready_events[i])
 
         moe_stream_acquire.apply(experts_stream[i], ready_events[i])
-        cur_l_aux, combine_weights[i], dispatch_mask, exp_counts = gata_fn(input_split)
+        cur_l_aux, combine_weights[i], dispatch_mask, exp_counts = gate_fn(input_split)
         dispatched_inputs[i] = einsum(
             "sec,sm->ecm", dispatch_mask.type_as(input_split), input_split
         )  # TODO: heavy memory usage due to long sequence length
