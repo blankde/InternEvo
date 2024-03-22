@@ -221,7 +221,7 @@ class ISPCommunicator:
                     self._overlap_states[cid].index_to_block[idx] = block
                     for sub_name, sub in block.named_children():
                         for name, child in sub.named_children():
-                            if name in ["out_proj", "wo"]:
+                            if name in ["out_proj", "wo", "proj"]:
                                 self._overlap_states[cid].isp_outs.append(child)
                                 self._overlap_states[cid].module_to_index[child] = idx
                             if isinstance(child, ISPLinear):

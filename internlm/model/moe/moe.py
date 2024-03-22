@@ -38,6 +38,7 @@ class MoE(torch.nn.Module):
         num_experts=1,
         ep_group=None,
         ep_size=1,
+        ep_cls=None,
         device=None,
         dtype=None,
     ):
@@ -52,6 +53,7 @@ class MoE(torch.nn.Module):
             num_experts=num_experts,
             ep_group=ep_group,
             ep_size=ep_size,
+            ep_cls=ep_cls,
             device=device,
             dtype=dtype,
             **(gpc.config.moe)

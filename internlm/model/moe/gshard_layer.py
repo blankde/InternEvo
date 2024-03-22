@@ -390,6 +390,7 @@ class GShardMOELayer(BaseMoELayer):
         num_experts: int,
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
+        ep_cls: Optional[Callable] = None,
         top_k: int = 1,
         capacity_factor: float = 1.0,
         eval_capacity_factor: float = 1.0,
@@ -420,7 +421,7 @@ class GShardMOELayer(BaseMoELayer):
             ),
             torch.nn.ModuleList(
                 [
-                    FeedForward(
+                    ep_cls(
                         hidden_size,
                         int(hidden_size * gpc.config.model.mlp_ratio),
                         out_features=hidden_size,
