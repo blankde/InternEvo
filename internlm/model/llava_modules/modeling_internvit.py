@@ -64,26 +64,31 @@ except Exception:
     pass
 
 
+#TODO need to support tensor parallel and sequence parallel
 class VisionEmbeddings(nn.Module):
-    def __init__(self, config: InternVisionConfig):
+    def __init__(self, 
+        embed_dim: int = 768,  
+        image_size: int = 768,
+        patch_size: int = 16,   
+        dtype: torch.dtype = None,  
+        ):
         super().__init__()
-        self.config = config
-        self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
+        self.embed_dim = embed_dim
+        self.image_size = image_size
+        self.patch_size = patch_size
 
         self.class_embedding = nn.Parameter(
-            torch.randn(1, 1, self.embed_dim),
+            torch.randn(1, 1, self.embed_dim, dtype=dtype),
         )
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size, dtype=dtype
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
 
-        self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim))
+        self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim, dtype=dtype), )
 
     def _get_pos_embed(self, pos_embed, H, W):
         target_dtype = pos_embed.dtype
@@ -177,7 +182,7 @@ class VisionAttention(nn.Module):
         if self.tp_mode == "isp":
             self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=sequence_process_group)
 
-                # output projection always have the bias (for now)
+        # output projection always have the bias (for now)
         out_proj_cls = get_linear_cls(self.tp_mode, "row")
         self.proj = out_proj_cls(
             embed_dim,
@@ -241,6 +246,7 @@ class InternVisionEncoderLayer(nn.Module):
         initializer_factor: float = 0,
         drop_path_rate: float = 0.0,
         layer_norm_epsilon: float = 1e-6,
+        checkpoint: bool = False,
         qk_normalization: bool = False,
         qkv_bias: bool = False,
         norm_type: str = "rmsnorm",
@@ -253,10 +259,9 @@ class InternVisionEncoderLayer(nn.Module):
     ):
         super().__init__()
         self.embed_dim = hidden_size
+        self.checkpoint = checkpoint
         self.layer_idx = layer_idx
         self.use_flash_attn = use_flash_attn
-
-        head_dim = hidden_size // num_attention_heads
         self.tp_mode = tp_mode
         parallel_mode = ParallelMode.WEIGHT if self.tp_mode == "isp" else ParallelMode.TENSOR
 
@@ -315,7 +320,14 @@ class InternVisionEncoderLayer(nn.Module):
         self.drop_path1 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
         self.drop_path2 = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
-    def forward(
+    def forward(self, hidden_states):
+        if self.checkpoint and self.training:
+            return activation_checkpoint(
+                self._forward, False, hidden_states)
+        else:
+            return self._forward(hidden_states)
+
+    def _forward(
             self,
             hidden_states: torch.Tensor,
     ) -> Tuple[torch.FloatTensor, Optional[torch.FloatTensor], Optional[Tuple[torch.FloatTensor]]]:
@@ -340,21 +352,68 @@ class InternVisionEncoder(nn.Module):
             The corresponding vision configuration for the `InternEncoder`.
     """
 
-    def __init__(self):
+    def __init__(self,
+        num_layers: int = 12,
+        hidden_size: int = 768,
+        num_attention_heads: int = 12,
+        mlp_ratio: int = 4.0,
+        attn_drop_rate: float = 0.0,
+        attn_proj_drop: float = 0.0,
+        initializer_factor: float = 0,
+        drop_path_rate: float = 0.0,
+        dtype: torch.dtype = torch.float,
+        layer_norm_epsilon: float = 1e-5,
+        qk_normalization: bool = False,
+        qkv_bias: bool = False,
+        checkpoint: float = 0.0,
+        start_layer_idx: int = 0,
+        device: Optional[torch.device] = None,
+        norm_type: str = "rmsnorm",
+        use_flash_attn: bool = True,
+        output_hidden_states: bool = False,
+        use_return_dict: bool = False,
+        num_experts: int = 0,
+    ):
         super().__init__()
-        self.config = config
+        self.output_hidden_states = output_hidden_states
+        self.use_return_dict = use_return_dict
+        self.use_flash_attn =use_flash_attn
         # stochastic depth decay rule
-        dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.num_hidden_layers)]
-        self.layers = nn.ModuleList([
-            InternVisionEncoderLayer(config, dpr[idx]) for idx in range(config.num_hidden_layers)])
-        self.gradient_checkpointing = True
+        if isinstance(gpc.config.parallel["tensor"], dict):
+            self.tp_mode = gpc.config.parallel["tensor"].get("mode", "mtp")
+        checkpoint_layer_num = int(num_layers * checkpoint)
+        self.layers = nn.ModuleList(
+            [
+                InternVisionEncoderLayer(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                mlp_ratio=mlp_ratio,
+                attn_drop_rate=attn_drop_rate,
+                attn_proj_drop=attn_proj_drop,
+                initializer_factor=initializer_factor,
+                drop_path_rate=drop_path_rate,
+                layer_norm_epsilon=layer_norm_epsilon,
+                qk_normalization= qk_normalization,
+                qkv_bias= qkv_bias,
+                norm_type=norm_type,
+                layer_idx=lid + start_layer_idx,  # This parameter is used for caching during generation
+                checkpoint=lid < checkpoint_layer_num,
+                dtype=dtype,
+                device=device,
+                use_flash_attn=use_flash_attn,
+                tp_mode=self.tp_mode,
+                num_experts=num_experts,
+                )
+                for lid in range(num_layers)
+            ]
+        )
 
     def forward(
             self,
             inputs_embeds,
             output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutput]:
+            # return_dict: Optional[bool] = None,
+    ):
         r"""
         Args:
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -366,26 +425,20 @@ class InternVisionEncoder(nn.Module):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.use_return_dict
 
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        #TODO split_forward_gather_backward
 
-        for idx, encoder_layer in enumerate(self.layers):
+        for _, encoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
-            if self.gradient_checkpointing and self.training:
-                layer_outputs = torch.utils.checkpoint.checkpoint(
-                    encoder_layer,
-                    hidden_states)
-            else:
-                layer_outputs = encoder_layer(
-                    hidden_states,
-                )
+            layer_outputs = encoder_layer(
+                hidden_states,
+            )
             hidden_states = layer_outputs
 
         if output_hidden_states:
@@ -394,7 +447,6 @@ class InternVisionEncoder(nn.Module):
         if not return_dict:
             return tuple(v for v in [hidden_states, encoder_states] if v is not None)
         
-        #TODO gather_forward_split_backward
         return BaseModelOutput(
             last_hidden_state=hidden_states, hidden_states=encoder_states
         )
@@ -402,19 +454,66 @@ class InternVisionEncoder(nn.Module):
 
 class InternVisionModel(PreTrainedModel):
     main_input_name = 'pixel_values'
-    config_class = InternVisionConfig
     _no_split_modules = ['InternVisionEncoderLayer']
 
-    def __init__(self, config: InternVisionConfig):
-        super().__init__(config)
-        self.config = config
+    def __init__(self,
+        num_layers: int = 12,
+        hidden_size: int = 768,
+        image_size: int = 768,
+        patch_size: int = 16,  
+        num_attention_heads: int = 12,
+        mlp_ratio: int = 4.0,
+        attn_drop_rate: float = 0.0,
+        attn_proj_drop: float = 0.0,
+        initializer_factor: float = 0,
+        drop_path_rate: float = 0.0,
+        dtype: torch.dtype = torch.float,
+        layer_norm_epsilon: float = 1e-5,
+        qk_normalization: bool = False,
+        qkv_bias: bool = False,
+        # first: bool = False, #TODO not support pipeline for now
+        checkpoint: float = 0.0,
+        start_layer_idx: int = 0,
+        device: Optional[torch.device] = None,
+        norm_type: str = "rmsnorm",
+        use_flash_attn: bool = True,
+        num_experts: int = 0,
+    ):
 
-        self.embeddings = InternVisionEmbeddings(config)
-        self.encoder = InternVisionEncoder(config)
+        super().__init__()
+
+        self.embeddings = VisionEmbeddings(
+            embed_dim=hidden_size,  
+            image_size=image_size,
+            patch_size=patch_size,   
+            dtype=dtype,
+        )
+
+        self.encoder = InternVisionEncoder(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            mlp_ratio=mlp_ratio,
+            attn_drop_rate=attn_drop_rate,
+            attn_proj_drop=attn_proj_drop,
+            initializer_factor=initializer_factor,
+            drop_path_rate=drop_path_rate,
+            dtype=dtype,
+            layer_norm_epsilon=layer_norm_epsilon,
+            qk_normalization=qk_normalization,
+            qkv_bias=qkv_bias,
+            checkpoint=checkpoint,
+            start_layer_idx=start_layer_idx,
+            device=device,
+            norm_type=norm_type,
+            use_flash_attn=use_flash_attn,
+            num_experts=num_experts,
+        )
+
 
     def resize_pos_embeddings(self, old_size, new_size, patch_size):
         pos_emb = self.embeddings.position_embedding
-        _, num_positions, embed_dim = pos_emb.shape
+        _, _, embed_dim = pos_emb.shape
         cls_emb = pos_emb[:, :1, :]
         pos_emb = pos_emb[:, 1:, :].reshape(1, old_size // patch_size, old_size // patch_size, -1).permute(0, 3, 1, 2)
         pos_emb = F.interpolate(pos_emb.float(), size=new_size // patch_size, mode='bicubic', align_corners=False)
@@ -448,12 +547,16 @@ class InternVisionModel(PreTrainedModel):
                 hidden_states = self.embeddings(pixel_values)
             else:
                 raise ValueError(f'wrong pixel_values size: {pixel_values.shape}')
+
+        if gpc.config.parallel.sequence_parallel and self.tp_mode == "isp":
+            indexes = split_forward_gather_backward(indexes, ParallelMode.TENSOR, dim=0)
+
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        last_hidden_state = encoder_outputs.last_hidden_state
+        last_hidden_state = encoder_outputs[0]
         pooled_output = last_hidden_state[:, 0, :]
 
         if not return_dict:
@@ -465,3 +568,17 @@ class InternVisionModel(PreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
+    
+
+def build_intern_vision_model(vision_tower_cfg, device):
+    """
+    build generic model 1d
+
+    Args:
+        vision_tower_cfg: The intern vision model config.
+        device (Optional[Union[str, torch.device]]): The device will be used. torch.device("cuda") by default.
+
+    """
+    model = InternVisionModel(**filter_kwargs(InternVisionModel.__init__, vision_tower_cfg)).to(device)
+
+    return model

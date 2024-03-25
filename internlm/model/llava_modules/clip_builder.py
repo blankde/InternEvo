@@ -1,10 +1,13 @@
 import os
 
 from .clip_encoder import CLIPVisionTower
+from .modeling_internvit import build_intern_vision_model
 
 
-def build_vision_tower(vision_tower_cfg, **kwargs):
+def build_vision_tower(vision_tower_cfg=None, **kwargs):
     print(vision_tower_cfg)
+    if vision_tower_cfg is None:
+        model = build_intern_vision_model(vision_tower_cfg)
     vision_tower = vision_tower_cfg.get("mm_vision_tower", None)
     is_absolute_path_exists = os.path.exists(vision_tower)
     if is_absolute_path_exists or vision_tower.startswith("openai") or vision_tower.startswith("laion"):
