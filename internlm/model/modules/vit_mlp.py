@@ -50,7 +50,7 @@ class BaseVisionFeedForward(nn.Module):
         out_features: int = None,
         process_group: Optional[torch.distributed.ProcessGroup] = None,
         bias: bool = True,
-        hidden_act = None,
+        # hidden_act = None, #TODO
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         multiple_of: int = 256,
@@ -58,7 +58,7 @@ class BaseVisionFeedForward(nn.Module):
         row_cls: Optional[Callable] = None,
     ):
         super().__init__()
-        self.act = ACT2FN[hidden_act]
+        self.act = ACT2FN["gelu"]
         hidden_features = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
 
 

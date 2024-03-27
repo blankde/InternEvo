@@ -29,9 +29,6 @@ from internlm.model.utils import (
     try_import_RMSNorm,
 )
 
-
-MODEL_TYPE = "INTERNVIT"
-
 logger = get_logger(__file__)
 RMSNorm = try_import_RMSNorm()
 
@@ -70,25 +67,25 @@ class VisionEmbeddings(nn.Module):
         embed_dim: int = 768,  
         image_size: int = 768,
         patch_size: int = 16,   
-        dtype: torch.dtype = None,  
+        dtype: torch.dtype = None,
+        device: Optional[torch.device] = None,
         ):
         super().__init__()
         self.embed_dim = embed_dim
         self.image_size = image_size
         self.patch_size = patch_size
-
         self.class_embedding = nn.Parameter(
-            torch.randn(1, 1, self.embed_dim, dtype=dtype),
+            torch.randn(1, 1, self.embed_dim, dtype=dtype, device=device),
         )
 
         self.patch_embedding = nn.Conv2d(
-            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size, dtype=dtype
+            in_channels=3, out_channels=self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size, dtype=dtype, device=device
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
         self.num_positions = self.num_patches + 1
 
-        self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim, dtype=dtype), )
+        self.position_embedding = nn.Parameter(torch.randn(1, self.num_positions, self.embed_dim, dtype=dtype, device=device), )
 
     def _get_pos_embed(self, pos_embed, H, W):
         target_dtype = pos_embed.dtype
@@ -147,7 +144,6 @@ class VisionAttention(nn.Module):
                 f' {self.num_heads}).'
             )
 
-        self.scale = self.head_dim ** -0.5
         # TODO embedding not support tp
         Wqkv_cls = get_linear_cls(self.tp_mode, "column")
         self.Wqkv = Wqkv_cls(
@@ -241,7 +237,7 @@ class InternVisionEncoderLayer(nn.Module):
         hidden_size: int = 768,
         num_attention_heads: int = 12,
         mlp_ratio: int = 4,
-        attn_attention_drop: float = 0,
+        attn_drop: float = 0,
         attn_proj_drop : float = 0,
         initializer_factor: float = 0,
         drop_path_rate: float = 0.0,
@@ -265,12 +261,12 @@ class InternVisionEncoderLayer(nn.Module):
         self.tp_mode = tp_mode
         parallel_mode = ParallelMode.WEIGHT if self.tp_mode == "isp" else ParallelMode.TENSOR
 
-        self.mixer = VisionAttention(
+        self.attn = VisionAttention(
             embed_dim=hidden_size,
             num_heads=num_attention_heads,
             process_group=gpc.get_group(parallel_mode),
             sequence_process_group=gpc.get_group(ParallelMode.TENSOR),
-            attention_dropout = attn_attention_drop,
+            attention_dropout = attn_drop,
             proj_dropout=attn_proj_drop,
             qk_normalization = qk_normalization,
             layer_norm_epsilon = layer_norm_epsilon,
@@ -357,7 +353,7 @@ class InternVisionEncoder(nn.Module):
         hidden_size: int = 768,
         num_attention_heads: int = 12,
         mlp_ratio: int = 4.0,
-        attn_drop_rate: float = 0.0,
+        attn_drop: float = 0.0,
         attn_proj_drop: float = 0.0,
         initializer_factor: float = 0,
         drop_path_rate: float = 0.0,
@@ -388,7 +384,7 @@ class InternVisionEncoder(nn.Module):
                 hidden_size=hidden_size,
                 num_attention_heads=num_attention_heads,
                 mlp_ratio=mlp_ratio,
-                attn_drop_rate=attn_drop_rate,
+                attn_drop=attn_drop,
                 attn_proj_drop=attn_proj_drop,
                 initializer_factor=initializer_factor,
                 drop_path_rate=drop_path_rate,
@@ -412,7 +408,7 @@ class InternVisionEncoder(nn.Module):
             self,
             inputs_embeds,
             output_hidden_states: Optional[bool] = None,
-            # return_dict: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
     ):
         r"""
         Args:
@@ -452,7 +448,7 @@ class InternVisionEncoder(nn.Module):
         )
 
 
-class InternVisionModel(PreTrainedModel):
+class InternVisionModel(nn.Module):
     main_input_name = 'pixel_values'
     _no_split_modules = ['InternVisionEncoderLayer']
 
@@ -463,7 +459,7 @@ class InternVisionModel(PreTrainedModel):
         patch_size: int = 16,  
         num_attention_heads: int = 12,
         mlp_ratio: int = 4.0,
-        attn_drop_rate: float = 0.0,
+        attn_drop: float = 0.0,
         attn_proj_drop: float = 0.0,
         initializer_factor: float = 0,
         drop_path_rate: float = 0.0,
@@ -478,9 +474,13 @@ class InternVisionModel(PreTrainedModel):
         norm_type: str = "rmsnorm",
         use_flash_attn: bool = True,
         num_experts: int = 0,
+        output_hidden_states: bool = False,
+        use_return_dict: bool = False,
     ):
 
         super().__init__()
+        self.output_hidden_states = output_hidden_states
+        self.use_return_dict = use_return_dict
 
         self.embeddings = VisionEmbeddings(
             embed_dim=hidden_size,  
@@ -494,7 +494,7 @@ class InternVisionModel(PreTrainedModel):
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             mlp_ratio=mlp_ratio,
-            attn_drop_rate=attn_drop_rate,
+            attn_drop=attn_drop,
             attn_proj_drop=attn_proj_drop,
             initializer_factor=initializer_factor,
             drop_path_rate=drop_path_rate,
@@ -508,6 +508,8 @@ class InternVisionModel(PreTrainedModel):
             norm_type=norm_type,
             use_flash_attn=use_flash_attn,
             num_experts=num_experts,
+            output_hidden_states=output_hidden_states,
+            use_return_dict=use_return_dict,
         )
 
 
@@ -533,9 +535,9 @@ class InternVisionModel(PreTrainedModel):
             pixel_embeds: Optional[torch.FloatTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else self.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.use_return_dict
 
         if pixel_values is None and pixel_embeds is None:
             raise ValueError('You have to specify pixel_values or pixel_embeds')
@@ -570,7 +572,7 @@ class InternVisionModel(PreTrainedModel):
         )
     
 
-def build_intern_vision_model(vision_tower_cfg, device):
+def build_intern_vision_model(vision_tower_cfg, dtype=None, device=torch.device("cuda")):
     """
     build generic model 1d
 
@@ -579,6 +581,9 @@ def build_intern_vision_model(vision_tower_cfg, device):
         device (Optional[Union[str, torch.device]]): The device will be used. torch.device("cuda") by default.
 
     """
+    vision_tower_cfg["device"] = device
+    vision_tower_cfg["dtype"] = dtype
+    vision_tower_cfg["start_layer_idx"] = 0
     model = InternVisionModel(**filter_kwargs(InternVisionModel.__init__, vision_tower_cfg)).to(device)
 
     return model

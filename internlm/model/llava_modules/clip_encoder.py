@@ -14,6 +14,9 @@ class CLIPVisionTower(nn.Module):  # pylint: disable=C0115
         self.select_layer = args.get("mm_vision_select_layer", -2)
         self.select_feature = args.get("mm_vision_select_feature", "patch")
 
+        if vision_tower_cfg is not None:
+            self.vision_tower = build_intern_vision_model(vision_tower_cfg, dtype, device)
+            return model
         if not delay_load:
             self.load_model()
             self.image_size = self.config.image_size
@@ -27,6 +30,7 @@ class CLIPVisionTower(nn.Module):  # pylint: disable=C0115
         self.is_loaded = True
 
     def feature_select(self, image_forward_outs):
+        print(self.select_layer, self.select_feature, flush=True)
         image_features = image_forward_outs.hidden_states[self.select_layer]
         if self.select_feature == "patch":
             image_features = image_features[:, 1:]

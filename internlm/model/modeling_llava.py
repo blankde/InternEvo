@@ -927,7 +927,7 @@ class PackedFlashLlama1D(nn.Module):
         if first:
             from internlm.model.llava_modules.clip_builder import build_vision_tower
 
-            self.vit = build_vision_tower(vit_cfg)
+            self.vit = build_vision_tower(vit_cfg, dtype=dtype, device=device)
             self.vit.requires_grad_(False)
 
         assert vision_proj_cfg is not None
