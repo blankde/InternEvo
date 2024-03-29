@@ -56,6 +56,8 @@ from internlm.core.context import global_context as gpc
 logger = get_logger(__file__)
 RMSNorm = try_import_RMSNorm()
 
+from .configuration_internlm2 import InternLM2Config
+
 _CONFIG_FOR_DOC = 'InternLM2Config'
 
 flash_attn_func, flash_attn_varlen_func = None, None
@@ -266,33 +268,20 @@ class InternLM2Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
     def __init__(self,         
-        embed_dim: int,
-        num_heads: int,
-        num_kv_heads: int,
+        config: InternLM2Config,
         process_group: Optional[torch.distributed.ProcessGroup],
-        sequence_process_group: Optional[torch.distributed.ProcessGroup],
-        attention_dropout: float = 0.0,
-        proj_dropout: float = 0.0,
-        qk_normalization: bool = False,
-        layer_norm_epsilon: float = 0.0,
-        bias: bool = False,
-        layer_idx: int = None,
-        use_flash_attn: bool = True,
-        norm_type: str = "rmsnorm",
-        max_position_embeddings: int =2048,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
         tp_mode: str = "mtp",
     ):
-        factory_kwargs = {"device": device, "dtype": dtype}
+        factory_kwargs = {"device": config.device, "dtype": config.dtype}
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_kv_heads = num_kv_heads
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = max_position_embeddings
+        self.max_position_embeddings = config.max_position_embeddings
         self.is_causal = True
+        self.tp_mode = tp_mode
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -302,10 +291,10 @@ class InternLM2Attention(nn.Module):
 
         Wqkv_cls = get_linear_cls(self.tp_mode, "column")
         self.Wqkv = Wqkv_cls(
-            embed_dim,
+            self.hidden_size,
             (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim,
             process_group,
-            bias=bias,
+            bias=config.bias,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
             **factory_kwargs,
         )
@@ -315,7 +304,7 @@ class InternLM2Attention(nn.Module):
             self.num_heads * self.head_dim,
             self.hidden_size,
             process_group,
-            bias=bias,
+            bias=config.bias,
             sequence_parallel=gpc.config.parallel.sequence_parallel,
             **factory_kwargs,
         )
@@ -626,11 +615,11 @@ class InternLM2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.attention = INTERNLM2_ATTENTION_CLASSES[config.attn_implementation](config=config)
+        self.attention = INTERNLM2_ATTENTION_CLASSES[config.attn_implementation](config=config, tp_mode = tp_mode)
 
         self.feed_forward = InternLM2MLP(config)
-        self.attention_norm = InternLM2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ffn_norm = InternLM2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -825,7 +814,7 @@ class InternLM2Model(InternLM2PreTrainedModel):
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
 
         self.layers = nn.ModuleList([InternLM2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
-        self.norm = InternLM2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
