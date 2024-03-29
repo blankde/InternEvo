@@ -1,8 +1,9 @@
+from typing import Callable, Optional
+
 import torch
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
-from internlm.model.modules.mlp import FeedForward
 from internlm.utils.logger import get_logger
 from internlm.utils.registry import MODEL_INITIALIZER
 
@@ -34,10 +35,14 @@ class MoE(torch.nn.Module):
 
     def __init__(
         self,
-        hidden_size,
-        num_experts=1,
-        ep_group=None,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        ep_cls: Optional[Callable],
+        ep_group: Optional[torch.distributed.ProcessGroup],
+        num_experts: int = 1,
         ep_size=1,
+        use_residual: bool = False,
         device=None,
         dtype=None,
     ):
@@ -48,8 +53,11 @@ class MoE(torch.nn.Module):
             gpc.config.moe = dict()
 
         self.moe_layer = MODEL_INITIALIZER.get_module(module_name=gpc.config.model.moe_type)(
-            hidden_size=hidden_size,
+            in_features=in_features,
+            hidden_features=hidden_features,
+            out_features=out_features,
             num_experts=num_experts,
+            ep_cls=ep_cls,
             ep_group=ep_group,
             ep_size=ep_size,
             device=device,
@@ -58,19 +66,19 @@ class MoE(torch.nn.Module):
         )
 
         # residual network, see https://arxiv.org/pdf/2201.05596.pdf, seems useful for convergence
-        self.use_residual = gpc.config.model.moe_use_residual
+        self.use_residual = use_residual
         if self.use_residual:
-            self.residual_mlp = FeedForward(
-                hidden_size,
-                int(hidden_size * gpc.config.model.mlp_ratio),
-                out_features=hidden_size,
+            self.residual_mlp = ep_cls(
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
                 process_group=gpc.get_group(ParallelMode.TENSOR),
                 bias=False,
                 device=device,
                 dtype=dtype,
             )
             # coefficient is used for weighted sum of the output of expert and residual mlp
-            self.coefficient = torch.nn.Linear(hidden_size, 2)
+            self.coefficient = torch.nn.Linear(in_features, 2)
 
     def forward(self, hidden_states, used_token=None):
         """MoE forward

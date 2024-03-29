@@ -150,9 +150,13 @@ class PackedFlashBaseLayer1D(nn.Module):
                 )
         else:
             # replace mlp by MoE module. The expert in MoE is a FeedForward module.
+            mlp_cls = get_mlp_cls(self.tp_mode)
             self.mlp = MoE(
-                hidden_size=hidden_size,
+                hidden_size,
+                int(hidden_size * mlp_ratio),
+                out_features=hidden_size,
                 num_experts=num_experts,
+                ep_cls=mlp_cls,
                 ep_group=gpc.get_group(ParallelMode.EXPERT),
                 ep_size=ep_size,
                 device=device,
