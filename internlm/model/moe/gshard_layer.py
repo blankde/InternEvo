@@ -75,23 +75,32 @@ def einsum(rule, a, b):
     if USE_EINSUM:
         return torch.einsum(rule, a, b)
     elif rule == "s,se->se":
-        # [1, s] * [s, e]
+        # [s, 1] * [s, e]
         return a.reshape(a.shape[0], -1) * b
+    elif rule == "ks,kse->kse":
+        # [k, s, 1] * [s, e]
+        return a.reshape(a.shape[0], a.shape[1], -1) * b
     elif rule == "se,sc->sec":
         # [s,e,1] * [s,1,c]
         return a.unsqueeze(2) * b.unsqueeze(1)
+    elif rule == "kse,ksc->ksec":
+        # [k,s,e,1] * [k,s,1,c]
+        return a.unsqueeze(3) * b.unsqueeze(2)
     elif rule == "se,se->s":
-        # [s,1,e] * [s,e,1]
+        # [s,1,e] @ [s,e,1]
         return torch.bmm(a.unsqueeze(1), b.unsqueeze(2)).reshape(-1)
+    elif rule == "se,kse->ks":
+        # [s,1,e] @ [k,s,e,1]
+        return torch.matmul(a.unsqueeze(1), b.unsqueeze(3)).reshape(b.shape[0], -1)
     elif rule == "sec,sm->ecm":
-        # [e*c, s] * [s, m]
+        # [e, c, s] @ [s, m]
         s = a.shape[0]
         e = a.shape[1]
         c = a.shape[2]
         m = b.shape[1]
         return torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
     elif rule == "sec,ecm->sm":
-        # [s, e*c] * [e*c, m]
+        # [s, e*c] @ [e*c, m]
         return torch.matmul(a.reshape(a.shape[0], -1), b.reshape(-1, b.shape[-1]))
     elif rule == "ks,ksm->sm":
         k = b.shape[0]
@@ -101,7 +110,7 @@ def einsum(rule, a, b):
         a = a.t().unsqueeze(1)
         # [k,s,m] -> [k, sm] -> [sm, k] -> [s, m, k]
         b = b.reshape(k, -1).t().reshape(s, m, k)
-        # bmm([s, 1, k], [s, m, k]^t) -> [s, m, 1]
+        # [s, 1, k] @ [s, k, m]
         return torch.bmm(a, b.transpose(1, 2)).squeeze(2)
     else:
         return torch.einsum(rule, a, b)
@@ -283,6 +292,63 @@ def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tup
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
+def fused_topkgating(
+    logits: Tensor,
+    k: int,
+    capacity_factor: float,
+    min_capacity: int,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Implements TopKGating on logits."""
+    # everything is in fp32 in this function
+    gates = F.softmax(logits, dim=1)
+    num_experts = int(gates.shape[1])
+
+    capacity = _capacity(gates, torch.tensor(capacity_factor * k), torch.tensor(min_capacity))
+
+    # Create a mask by top-k experts
+    indices_s = torch.topk(gates, k, dim=1).indices
+    indices_s = indices_s.permute(1, 0).reshape(-1)
+    masks = F.one_hot(indices_s, num_classes=num_experts)
+
+    # Compute locations in capacity buffer
+    locations = torch.cumsum(masks, dim=0) - 1
+
+    # reshape (s,e) to (k,s,e)
+    masks = masks.reshape(-1, gates.shape[0], num_experts)
+    locations = locations.reshape(-1, gates.shape[0], num_experts)
+
+    # gating decisions
+    exp_counts = torch.sum(masks[0], dim=0).detach().to("cpu")
+
+    # Compute l_aux
+    me = torch.mean(gates, dim=0)
+    ce = torch.mean(masks[0].type_as(logits), dim=0)
+    l_aux = torch.mean(me * ce) * num_experts * num_experts
+
+    # Remove locations outside capacity from mask
+    masks *= torch.lt(locations, capacity)
+
+    # Store the capacity location for each token
+    locations_s = torch.sum(locations * masks, dim=2)
+
+    # Normalize gate probabilities
+    mask_float = masks.type_as(logits)
+    gate_s = einsum("se,kse->ks", gates, mask_float)
+    denom_s = torch.sum(gate_s, dim=0)
+    # Avoid divide-by-zero
+    denom_s = torch.clamp(denom_s, min=torch.finfo(denom_s.dtype).eps)
+    gate_s /= denom_s
+
+    # Calculate combine_weights and dispatch_mask
+    gate_all = einsum("ks,kse->kse", gate_s, mask_float)
+    locations_sc = F.one_hot(locations_s, num_classes=capacity).type_as(logits)
+    combine_sec = einsum("kse,ksc->ksec", gate_all, locations_sc)
+    combine_weights = torch.sum(combine_sec, dim=0)
+    dispatch_mask = combine_weights.bool()
+
+    return l_aux, combine_weights, dispatch_mask, exp_counts
+
+
 class TopKGate(Module):
     """Gate module which implements Top2Gating as described in Gshard_.
     ::
@@ -312,13 +378,10 @@ class TopKGate(Module):
         noisy_gate_policy: Optional[str] = None,
         drop_tokens: bool = True,
         use_rts: bool = True,
+        use_fused_gating: bool = False,
     ) -> None:
         super().__init__()
-
-        # Only top-1 and top-2 are supported at the moment.
-        if topk not in (1, 2):
-            raise ValueError("Only top-1 and top-2 gatings are supported.")
-        # Deepspeed's mechisms, alway use fp32
+        # alway use fp32
         self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
         self.k = topk
         self.capacity_factor = capacity_factor
@@ -329,6 +392,7 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
+        self.use_fused_gating = use_fused_gating
 
     def forward(
         self, inputs: torch.Tensor, used_token: torch.Tensor = None
@@ -341,7 +405,13 @@ class TopKGate(Module):
             inputs = multiplicative_jitter(inputs, device=inputs.device)
         logits = self.wg(inputs)
 
-        if self.k == 1:
+        if self.use_fused_gating or self.k > 2:
+            assert self.noisy_gate_policy != "RSample", "RSample noisy is not supported by fused_gating policy"
+            gate_output = fused_topkgating(
+                logits, self.k, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
+            )
+        # deepspeed-style code
+        elif self.k == 1:
             gate_output = top1gating(
                 logits,
                 self.capacity_factor if self.training else self.eval_capacity_factor,
@@ -352,10 +422,12 @@ class TopKGate(Module):
                 self.use_rts,
             )
 
-        else:
+        elif self.k == 2:
             gate_output = top2gating(
                 logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
             )
+        else:
+            assert False, "Unsupported gating policy"
 
         if self.wall_clock_breakdown:
             timer("TopKGate").stop()
@@ -399,6 +471,7 @@ class GShardMOELayer(BaseMoELayer):
         noisy_gate_policy: str = None,
         drop_tokens: bool = True,
         use_rts: bool = True,
+        use_fused_gating: bool = False,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.device] = None,
     ) -> None:
@@ -419,6 +492,7 @@ class GShardMOELayer(BaseMoELayer):
                 noisy_gate_policy,
                 drop_tokens,
                 use_rts,
+                use_fused_gating,
             ),
             torch.nn.ModuleList(
                 [
