@@ -209,6 +209,7 @@ moe = dict(
     noisy_gate_policy=None,
     drop_tokens=True,
     use_rts=True,
+    use_fused_gating=False,
 )
 
 # MegaBlock MoE config
