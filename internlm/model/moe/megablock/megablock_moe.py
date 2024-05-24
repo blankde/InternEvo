@@ -31,10 +31,12 @@ class MegaBlockMoE(BaseMoELayer):
 
     def __init__(
         self,
-        hidden_size: int,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        num_experts: int,
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
-        num_experts: int,
         top_k: int = 1,
         capacity_factor: float = 1.0,
         drop_tokens: bool = True,
@@ -43,19 +45,21 @@ class MegaBlockMoE(BaseMoELayer):
         multiple_of: int = 256,
     ) -> None:
         assert not gpc.config.parallel.sequence_parallel, "do not support sequence parallel"
+        assert ops is not None, 'MegaBlocks not found, please run "pip install megablocks".'
         self.top_k = top_k
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = multiple_of * ((int(hidden_size * gpc.config.model.mlp_ratio) + multiple_of - 1) // multiple_of)
+        self.ffn_dim = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
         self.capacity_factor = capacity_factor
         self.drop_tokens = drop_tokens
         assert self.ffn_dim % tp_size == 0
         super().__init__(
-            torch.nn.Linear(hidden_size, num_experts, bias=False),
+            torch.nn.Linear(in_features, num_experts, bias=False),
             MegaBlockFeedForward(
-                hidden_size,
+                in_features,
                 self.ffn_dim // tp_size,
+                out_features,
                 num_experts // ep_size,
                 device,
                 dtype,

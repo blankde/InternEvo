@@ -21,6 +21,7 @@ class MegaBlockFeedForward(nn.Module):
         self,
         in_features: int,
         hidden_features: int,
+        out_features: int,
         num_local_experts: int,
         device=None,
         dtype=None,
@@ -29,8 +30,10 @@ class MegaBlockFeedForward(nn.Module):
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
         self.w1 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
-        self.w3 = nn.Parameter(torch.empty(num_local_experts, hidden_features, in_features, device=device, dtype=dtype))
+        self.w3 = nn.Parameter(torch.empty(num_local_experts, in_features, hidden_features, device=device, dtype=dtype))
+        self.w2 = nn.Parameter(
+            torch.empty(num_local_experts, hidden_features, out_features, device=device, dtype=dtype)
+        )
 
     def forward(self, x):
         # TODO w2 and w3 should swap
@@ -51,6 +54,7 @@ class MegaBlockGroupedFeedForward(nn.Module):
         self,
         in_features: int,
         hidden_features: int,
+        out_features: int,
         parallel_mode="tensor",
         device=None,
         dtype=None,
@@ -59,7 +63,7 @@ class MegaBlockGroupedFeedForward(nn.Module):
 
         # merged expert weights, all of size  (ffn_dim * n_experts, model_dim)
         self.w1 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
-        self.w2 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
+        self.w2 = nn.Parameter(torch.empty(hidden_features, out_features, device=device, dtype=dtype))
         self.w3 = nn.Parameter(torch.empty(hidden_features, in_features, device=device, dtype=dtype))
 
         self.parallel_mode = parallel_mode

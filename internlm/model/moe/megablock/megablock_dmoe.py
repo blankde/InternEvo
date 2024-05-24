@@ -15,7 +15,7 @@ try:
     from megablocks import ops
 except (ModuleNotFoundError, ImportError):
     stk = None
-    megablocks = None
+    ops = None
 
 
 class MegaBlockdMoE(MegaBlockMoE):
@@ -33,10 +33,12 @@ class MegaBlockdMoE(MegaBlockMoE):
 
     def __init__(  # pylint: disable=W0231
         self,
-        hidden_size: int,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        num_experts: int,
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
-        num_experts: int,
         top_k: int = 1,
         parallel_mode: str = "tensor",
         device: Optional[torch.device] = None,
@@ -44,11 +46,12 @@ class MegaBlockdMoE(MegaBlockMoE):
         multiple_of: int = 256,
     ) -> None:
         assert gpc.expert_parallel_size == 1, "do not support expert parallel"
+        assert ops is not None and stk is not None, "MegaBlocks not found, please run " '"pip install megablocks".'
         self.top_k = top_k
         self.num_experts = num_experts
 
         tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        self.ffn_dim = multiple_of * ((int(hidden_size * gpc.config.model.mlp_ratio) + multiple_of - 1) // multiple_of)
+        self.ffn_dim = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
         assert self.ffn_dim % tp_size == 0
         if parallel_mode == "tensor":
             self.ffn_dim_per_row = self.ffn_dim // tp_size // ep_size
@@ -56,10 +59,11 @@ class MegaBlockdMoE(MegaBlockMoE):
             self.ffn_dim_per_row = self.ffn_dim // ep_size
         BaseMoELayer.__init__(  # pylint: disable=W0233
             self,
-            torch.nn.Linear(hidden_size, num_experts, bias=False),
+            torch.nn.Linear(in_features, num_experts, bias=False),
             MegaBlockGroupedFeedForward(
-                hidden_size,
+                in_features,
                 (self.ffn_dim // tp_size) * (num_experts // ep_size),
+                out_features,
                 parallel_mode,
                 device,
                 dtype,
