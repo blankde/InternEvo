@@ -218,6 +218,8 @@ moe = dict(
     drop_tokens=True,
     use_rts=True,
     use_fused_gating=False,
+    enable_token_rearrange_opt = True,
+    use_tutel = True,
 )
 
 # MegaBlock MoE config

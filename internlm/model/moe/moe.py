@@ -4,7 +4,7 @@ import torch
 
 from internlm.core.context import global_context as gpc
 from internlm.model.modules.mlp import new_feed_forward
-from internlm.model.moe.gshard_layer import GShardMOELayer
+from internlm.model.moe.gshard_layer import GShardMoELayer
 from internlm.model.moe.megablock.megablock_dmoe import MegaBlockdMoE
 from internlm.model.moe.megablock.megablock_moe import MegaBlockMoE
 from internlm.utils.logger import get_logger
@@ -15,7 +15,7 @@ logger = get_logger(__file__)
 
 def new_moe_layer(moe_type: str, **kwargs):
     if moe_type == "GShard":
-        return GShardMOELayer(**kwargs)
+        return GShardMoELayer(**kwargs)
     elif moe_type == "MegaBlock":
         return MegaBlockMoE(**kwargs)
     elif moe_type == "MegaBlock-D":
