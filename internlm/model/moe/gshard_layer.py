@@ -521,6 +521,7 @@ class GShardMoELayer(BaseMoELayer):
         use_rts: bool = True,
         use_fused_gating: bool = False,
         enable_token_rearrange_opt: bool = False,
+        moe_intermediate_size: int = 1,
         use_tutel: bool = False,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
@@ -536,7 +537,7 @@ class GShardMoELayer(BaseMoELayer):
             [
                 new_feed_forward(
                     in_features,
-                    hidden_features,
+                    moe_intermediate_size,
                     out_features,
                     bias=False,
                     device=device,
