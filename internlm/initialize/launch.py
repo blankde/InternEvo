@@ -91,7 +91,7 @@ def args_sanity_check():
         gpc.config.parallel._add_item("weight", dict(size=1, overlap=False, memory_pool=False))
 
     if "expert" not in gpc.config.parallel:
-        gpc.config.parallel._add_item("expert", dict(size=-1, no_tp=True))
+        gpc.config.parallel._add_item("expert", dict(size=-1, no_tp=False))
 
     if "expert_weight" not in gpc.config.parallel:
         gpc.config.parallel._add_item("expert_weight", dict(size=1, overlap=False, memory_pool=False))
