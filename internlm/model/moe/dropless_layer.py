@@ -197,18 +197,17 @@ class DroplessMoELayer(BaseMoELayer):
 
         self.input_splits = None
         self.output_splits = None
-        self.num_global_tokens_per_local_expert = None
+        self.num_global_tokens_per_local_expert_cpu = None
         # We need to keep track of the token num if we drop tokens without padding them.
         self.num_out_tokens = None
         self.hidden_shape = None
         # A cuda stream synchronization is needed due to no blocking sync between host and device
         self.device_sync_point = "no_sync"
-        if self.num_local_experts > 1 and self.ep_size > 1:
-            self.expert_ids_per_ep_rank = torch.tensor(
-                [i % self.num_local_experts for i in range(self.num_experts)],
-                dtype=torch.int32,
-                device=get_current_device(),
-            )
+        input_chunk_idxs = torch.arange(self.num_experts)  # * self.tp_size
+        # [num_local_experts, tp_size * ep_size]. Sort the input chunks by local experts.
+        self.sort_input_by_local_experts = input_chunk_idxs.reshape(-1, self.num_local_experts).T.ravel().tolist()
+        # [tp_size * ep_size, num_local_experts]. Restore the output chunks by local experts.
+        self.restore_output_by_local_experts = input_chunk_idxs.reshape(self.num_local_experts, -1).T.ravel().tolist()
         # self.num_input_tokens = None
 
         self.drop_and_pad = drop_and_pad
@@ -313,6 +312,8 @@ class DroplessMoELayer(BaseMoELayer):
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
+        # NOTE: bincount seem slower than histc
+        # num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
         num_local_tokens_per_expert = torch.histc(indices, bins=self.num_experts, min=0, max=self.num_experts)
         # num_local_tokens_per_expert: [num_experts]
 
@@ -322,12 +323,15 @@ class DroplessMoELayer(BaseMoELayer):
             num_tokens_per_local_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.ep_size, dtype=torch.long
             )
+            self.num_global_tokens_per_local_expert_cpu = torch.full(
+                (self.num_experts,), self.capacity, dtype=torch.long
+            )
             return num_tokens_per_local_expert
         elif self.capacity_factor is not None:
             self.num_out_tokens = num_local_tokens_per_expert.sum().to(torch.device("cpu"), non_blocking=True)
             self.device_sync_point = "before_permutation_1"
-        elif self.ep_size > 1:
-            # wait for input_splits and output_splits sync
+        elif self.ep_size > 1 or self.num_local_experts > 1:
+            # wait for input_splits and output_splits, or num_global_tokens_per_local_expert_cpu sync
             self.device_sync_point = "before_ep_alltoall"
         else:
             # wait for tokens_per_expert sync
@@ -347,8 +351,9 @@ class DroplessMoELayer(BaseMoELayer):
             num_global_tokens_per_expert = self._gather_along_first_dim_expert_parallel(
                 num_local_tokens_per_expert
             ).reshape(self.ep_size, self.num_experts)
-            self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, self.local_expert_indices]
+            num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, self.local_expert_indices]
 
+            # NOTE:another impl for num_global_tokens_per_local_expert calc, seems spent same time
             # self.num_global_tokens_per_local_expert = torch.empty_like(num_local_tokens_per_expert)
             # torch.distributed.all_to_all_single(
             #     self.num_global_tokens_per_local_expert, num_local_tokens_per_expert,
@@ -358,16 +363,16 @@ class DroplessMoELayer(BaseMoELayer):
             # reshape(self.ep_size, -1)
 
             self.output_splits = (
-                self.num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
+                num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True).numpy()
             )
-            num_tokens_per_local_expert = self.num_global_tokens_per_local_expert.sum(axis=0)
+            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
             # ===================================================
             # num_global_tokens_per_expert: [ep_size, num_experts]
             # num_global_tokens_per_local_expert: [ep_size, num_local_experts]
             # num_tokens_per_local_expert: [num_local_experts]
             # ===================================================
         else:
-            self.num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(-1, self.num_experts)
+            num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(self.num_experts)
             num_tokens_per_local_expert = num_local_tokens_per_expert
 
         if self.moe_grouped_mlp:
@@ -378,12 +383,9 @@ class DroplessMoELayer(BaseMoELayer):
             #     torch.arange(self.num_experts, dtype=torch.int32, device=indices.device),
             #     self.num_local_experts,  # mpu.experts_per_rank(self.args),
             # )
-            # No further synchronization is needed because torch.repeat_interleave() calls stream
-            # synchronization internally when the `output_size` parameter is not provided.
-            self.device_sync_point = "no_sync"
-            self.global_input_tokens_local_experts_indices = torch.repeat_interleave(
-                self.expert_ids_per_ep_rank, self.num_global_tokens_per_local_expert.ravel()
-            )
+            self.num_global_tokens_per_local_expert_cpu = num_global_tokens_per_local_expert.view(
+                -1, self.num_local_experts
+            ).to(torch.device("cpu"), non_blocking=True)
 
         self.l_aux = self.load_balancing_loss(num_local_tokens_per_expert, self.gates)
 
@@ -529,6 +531,12 @@ class DroplessMoELayer(BaseMoELayer):
 
         return unpermuted_tokens
 
+    def sort_chunks_by_idxs(self, inputs: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+        """Split and sort the input tensor based on the split_sizes and sorted indices."""
+        inputs = torch.split(inputs, split_sizes.tolist(), dim=0)
+        output = torch.cat([inputs[i] for i in sorted_idxs], dim=0)
+        return output
+
     def token_permutation(
         self,
         reshaped_inputs: torch.Tensor,
@@ -576,24 +584,11 @@ class DroplessMoELayer(BaseMoELayer):
 
         # Permutation 2: Sort alltoall output by local experts when num_local_experts > 1.
         if self.num_local_experts > 1 and self.ep_size > 1:
-            if not self.drop_and_pad:
-                if self.enable_fused_permute:
-                    global_input_tokens, self.reversed_global_input_permutation_mapping = grouped_gemm.ops.permute(
-                        global_input_tokens, self.global_input_tokens_local_experts_indices.to(torch.int32)
-                    )
-                else:
-                    global_input_tokens, self.reversed_global_input_permutation_mapping = self.permute(
-                        global_input_tokens, self.global_input_tokens_local_experts_indices
-                    )
-            else:
-                global_input_tokens = global_input_tokens.reshape(
-                    self.ep_size, self.num_local_experts, self.capacity, -1
-                )
-                global_input_tokens = (
-                    global_input_tokens.transpose(0, 1)
-                    .reshape(self.num_local_experts * self.ep_size * self.capacity, -1)
-                    .contiguous()
-                )
+            global_input_tokens = self.sort_chunks_by_idxs(
+                global_input_tokens,
+                self.num_global_tokens_per_local_expert_cpu.ravel(),
+                self.sort_input_by_local_experts,
+            )
 
         if self.device_sync_point == "before_premute_finish":
             internlm_accelerator.current_stream().synchronize()
@@ -617,23 +612,11 @@ class DroplessMoELayer(BaseMoELayer):
 
         # Unpermutation 2: expert output to AlltoAll input
         if self.num_local_experts > 1 and self.ep_size > 1:
-            if not self.drop_and_pad:
-                if self.enable_fused_permute:
-                    hidden_states = grouped_gemm.ops.unpermute(
-                        hidden_states, self.reversed_global_input_permutation_mapping
-                    )
-                else:
-                    hidden_states = self.unpermute(
-                        hidden_states,
-                        self.reversed_global_input_permutation_mapping,
-                    )
-            else:
-                hidden_states = hidden_states.reshape(self.num_local_experts, self.ep_size, self.capacity, -1)
-                hidden_states = (
-                    hidden_states.transpose(0, 1)
-                    .reshape(self.ep_size * self.num_local_experts * self.capacity, -1)
-                    .contiguous()
-                )
+            hidden_states = self.sort_chunks_by_idxs(
+                hidden_states,
+                self.num_global_tokens_per_local_expert_cpu.T.ravel(),
+                self.restore_output_by_local_experts,
+            )
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
