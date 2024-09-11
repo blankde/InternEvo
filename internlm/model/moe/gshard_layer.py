@@ -475,6 +475,7 @@ class GShardMoELayer(BaseMoELayer):
         drop_tokens: bool = True,
         use_rts: bool = True,
         use_fused_gating: bool = True,
+        custom_ffn: Module = None,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
             "Unsupported noisy_gate_policy: " + noisy_gate_policy
@@ -508,6 +509,7 @@ class GShardMoELayer(BaseMoELayer):
                         multiple_of=multiple_of,
                         activation_type=activation_type,
                         is_expert=True,
+                        cumstom_cls=custom_ffn,
                     )
                     for _ in range(num_experts // ep_size)
                 ]

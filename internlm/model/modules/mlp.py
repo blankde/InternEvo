@@ -133,16 +133,31 @@ def new_feed_forward(
     mlp_layer_fusion: Optional[bool] = False,
     activation_type: str = "swiglu",
     is_expert: bool = False,
+    cumstom_cls: nn.Module = None,
 ) -> FeedForward:
-    return FeedForward(
-        in_features,
-        hidden_features,
-        out_features,
-        bias,
-        device,
-        dtype,
-        multiple_of,
-        mlp_layer_fusion,
-        activation_type,
-        is_expert,
-    )
+    if cumstom_cls:
+        return cumstom_cls(
+            in_features,
+            hidden_features,
+            out_features,
+            bias,
+            device,
+            dtype,
+            multiple_of,
+            mlp_layer_fusion,
+            activation_type,
+            is_expert,
+        )
+    else:
+        return FeedForward(
+            in_features,
+            hidden_features,
+            out_features,
+            bias,
+            device,
+            dtype,
+            multiple_of,
+            mlp_layer_fusion,
+            activation_type,
+            is_expert,
+        )

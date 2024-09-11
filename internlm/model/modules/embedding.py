@@ -33,6 +33,7 @@ class Embedding1D(nn.Module):
         embedding_dim: int,
         *args,
         padding_idx: int = None,
+        device: Optional[torch.device] = None,
         dtype: torch.dtype = None,
         vocab_parallel: bool = False,
         **kwargs,
@@ -64,7 +65,7 @@ class Embedding1D(nn.Module):
             self.vocab_end_index = self.num_embeddings_per_partition
 
         self.weight = nn.Parameter(
-            torch.empty((self.num_embeddings_per_partition, self.embed_dim_per_partition), dtype=dtype)
+            torch.empty((self.num_embeddings_per_partition, self.embed_dim_per_partition), dtype=dtype, device=device)
         )
 
     def forward(self, input_: Tensor) -> Tensor:

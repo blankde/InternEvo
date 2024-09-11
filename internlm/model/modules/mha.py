@@ -158,9 +158,14 @@ class MHA(nn.Module):
 
         # rotary embedding
         indexes = kwargs.pop("indexes", 0)
-        max_seqlen = kwargs.get("max_seqlen", None)
-        q = self.rotary_emb(q, offsets=indexes, cache_type="query", interleaved=self.interleaved, max_seqlen=max_seqlen)
-        k = self.rotary_emb(k, offsets=indexes, cache_type="key", interleaved=self.interleaved, max_seqlen=max_seqlen)
+        if self.rotary_emb_dim > 0:
+            max_seqlen = kwargs.get("max_seqlen", None)
+            q = self.rotary_emb(
+                q, offsets=indexes, cache_type="query", interleaved=self.interleaved, max_seqlen=max_seqlen
+            )
+            k = self.rotary_emb(
+                k, offsets=indexes, cache_type="key", interleaved=self.interleaved, max_seqlen=max_seqlen
+            )
 
         # self attention
         kwargs = _convert_cu_seqlens_for_qksplited(kwargs)

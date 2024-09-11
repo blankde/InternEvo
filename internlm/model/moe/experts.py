@@ -57,10 +57,9 @@ class Experts(torch.nn.Module):
             chunks = inputs.split(split_size_or_sections, dim=split_dim)
         expert_outputs = []
         for chunk, expert in zip(chunks, self.wrapped_experts):
-            if len(chunk) != 0:
-                out = expert(chunk, **kwargs)
-                if isinstance(out, tuple):
-                    out = out[0]  # Ignore the bias term for now
-                expert_outputs += [out]
+            out = expert(chunk, **kwargs)
+            if isinstance(out, tuple):
+                out = out[0]  # Ignore the bias term for now
+            expert_outputs += [out]
         expert_output = torch.cat(expert_outputs, dim=split_dim)
         return expert_output

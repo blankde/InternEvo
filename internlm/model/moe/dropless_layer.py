@@ -152,6 +152,7 @@ class DroplessMoELayer(BaseMoELayer):
         moe_grouped_mlp: bool = True,
         enable_fused_permute: bool = True,
         token_dispatch_policy: str = "alltoall",
+        custom_ffn: Module = None,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
             "Unsupported noisy_gate_policy: " + noisy_gate_policy
@@ -175,6 +176,8 @@ class DroplessMoELayer(BaseMoELayer):
                         mlp_layer_fusion=mlp_layer_fusion,
                         multiple_of=multiple_of,
                         activation_type=activation_type,
+                        is_expert=True,
+                        cumstom_cls=custom_ffn,
                     )
                     for _ in range(num_experts // ep_size)
                 ]
