@@ -181,7 +181,8 @@ def load_model_checkpoint(folder, model):
     """
 
     # try to load expert parameter to separate files if model have moe layer
-    try_load_moe_checkpoint(folder, model, states, tp_rank, pp_rank)
+    expert_tp_rank = 0 if gpc.config.parallel.expert.no_tp else tp_rank
+    try_load_moe_checkpoint(folder, model, states, expert_tp_rank, pp_rank)
 
     if gpc.config.parallel.zero1.fsdp:
         missing_k, unexpected_keys = load_shard_state_dict(model, states, strict=False)
@@ -272,13 +273,15 @@ def save_model_checkpoint(folder, model):
 
         # try to save expert parameter to separate files if model have moe layer
         expert_dp_size = gpc.get_world_size(ParallelMode.EXPERT_DATA)
+        expert_tp_size = 1 if gpc.config.parallel.expert.no_tp else tp_size
         expert_dp_rank = gpc.get_local_rank(ParallelMode.EXPERT_DATA)
+        expert_tp_rank = 0 if gpc.config.parallel.expert.no_tp else tp_rank
         should_save_rank_pair.clear()
-        for i in range(tp_size):
+        for i in range(expert_tp_size):
             should_save_rank_pair.add((i, i % expert_dp_size))
 
-        if (tp_rank, expert_dp_rank) in should_save_rank_pair:
-            try_save_moe_checkpoint(folder, model, tp_rank, pp_rank)
+        if (expert_tp_rank, expert_dp_rank) in should_save_rank_pair:
+            try_save_moe_checkpoint(folder, model, expert_tp_rank, pp_rank)
 
     torch.distributed.barrier()
 
