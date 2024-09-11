@@ -193,6 +193,10 @@ expert parallel (dict):
         * if size == 1, all experts are placed in each device, running as dp-only.
         * if size > 1, all experts are placed in k devices and each device has n/k experts, where n is the total
             number of experts and k = size.
+expert weight parallel (dict):
+    1. size: int, the size of weight parallel for expert module, distinct with global weight parallel size.
+    2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
+    3. memory_pool: bool, enable/disable memory pool, defaults to False.
 """
 parallel = dict(
     zero1=dict(size=-1, fsdp=False),
@@ -200,6 +204,7 @@ parallel = dict(
     pipeline=dict(size=1, interleaved_overlap=True),
     weight=dict(size=1, overlap=True, memory_pool=True),
     expert=dict(size=-1, no_tp=False),
+    expert_weight=dict(size=1, overlap=True, memory_pool=True),
 )
 
 cudnn_deterministic = False
@@ -230,14 +235,6 @@ monitor = dict(
 #     use_rts=True,
 #     use_fused_gating=False,
 # )
-
-# MegaBlock MoE config
-moe = dict(
-    top_k=2,
-    #    capacity_factor=1.0, # only used in MegaBlock(non-dmoe)
-    #    drop_tokens=True, # only used in MegaBlock(non-dmoe)
-    # parallel_mode="tensor", # only used in MegaBlock-D(dmoe), parallel_mode can be tensor or weight
-)
 
 model_type = "INTERNLM_MoE"
 

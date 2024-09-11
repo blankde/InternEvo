@@ -191,6 +191,10 @@ expert parallel (dict):
         * if size == 1, all experts are placed in each device, running as dp-only.
         * if size > 1, all experts are placed in k devices and each device has n/k experts, where n is the total
             number of experts and k = size.
+expert weight parallel (dict):
+    1. size: int, the size of weight parallel for expert module, distinct with global weight parallel size.
+    2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
+    3. memory_pool: bool, enable/disable memory pool, defaults to False.
 """
 parallel = dict(
     zero1=dict(size=-1, fsdp=False),
