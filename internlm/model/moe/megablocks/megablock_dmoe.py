@@ -6,9 +6,9 @@ import torch
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.moe.base_layer import BaseMoELayer
-from internlm.model.moe.megablock.megablock_moe import MegaBlockMoE
-from internlm.model.moe.megablock.mlp import MegaBlockGroupedFeedForward
-from internlm.model.moe.megablock.utils import promote_scalar
+from internlm.model.moe.megablocks.megablock_moe import MegaBlockMoE
+from internlm.model.moe.megablocks.mlp import MegaBlockGroupedFeedForward
+from internlm.model.moe.megablocks.utils import promote_scalar
 
 try:
     import stk
@@ -37,13 +37,15 @@ class MegaBlockdMoE(MegaBlockMoE):
         hidden_features: int,
         out_features: int,
         num_experts: int,
+        top_k: int,
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
-        top_k: int = 1,
-        parallel_mode: str = "tensor",
         device: Optional[torch.device] = None,
         dtype: Optional[torch.device] = None,
+        mlp_layer_fusion: bool = False,  # pylint: disable=W0613
         multiple_of: int = 256,
+        activation_type: str = "swiglu",  # pylint: disable=W0613
+        parallel_mode: str = "tensor",
     ) -> None:
         assert gpc.expert_parallel_size == 1, "do not support expert parallel"
         assert ops is not None and stk is not None, "MegaBlocks not found, please run " '"pip install megablocks".'

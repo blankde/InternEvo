@@ -47,6 +47,7 @@ config = Config(
             pack_sample_into_one=False,
             min_length=0,
             total_steps=9999,
+            use_packed_dataset=True,
         ),
         model=dict(
             checkpoint=False,

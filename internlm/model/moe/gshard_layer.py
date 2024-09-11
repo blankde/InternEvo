@@ -436,7 +436,7 @@ class TopKGate(Module):
         return gate_output
 
 
-class GShardMOELayer(BaseMoELayer):
+class GShardMoELayer(BaseMoELayer):
     """MOELayer module which implements MixtureOfExperts as described in Gshard_.
     ::
 
@@ -460,18 +460,21 @@ class GShardMOELayer(BaseMoELayer):
         hidden_features: int,
         out_features: int,
         num_experts: int,
+        top_k: int,
         ep_group: Optional[torch.distributed.ProcessGroup],
         ep_size: int,
-        top_k: int = 1,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.device] = None,
+        mlp_layer_fusion: bool = False,
+        multiple_of: int = 256,
+        activation_type: str = "swiglu",
         capacity_factor: float = 1.0,
         eval_capacity_factor: float = 1.0,
         min_capacity: int = 4,
         noisy_gate_policy: str = None,
         drop_tokens: bool = True,
         use_rts: bool = True,
-        use_fused_gating: bool = False,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.device] = None,
+        use_fused_gating: bool = True,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
             "Unsupported noisy_gate_policy: " + noisy_gate_policy
@@ -501,6 +504,9 @@ class GShardMOELayer(BaseMoELayer):
                         bias=False,
                         device=device,
                         dtype=dtype,
+                        mlp_layer_fusion=mlp_layer_fusion,
+                        multiple_of=multiple_of,
+                        activation_type=activation_type,
                         is_expert=True,
                     )
                     for _ in range(num_experts // ep_size)
@@ -546,7 +552,7 @@ class GShardMOELayer(BaseMoELayer):
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_inputs = dispatched_inputs.reshape(self.ep_size, self.num_local_experts, -1, d_model)
 
-        expert_output = self.experts(dispatched_inputs)
+        expert_output = self.experts(dispatched_inputs, split_dim=1)
 
         if self.wall_clock_breakdown:
             timer("salltoall").start()

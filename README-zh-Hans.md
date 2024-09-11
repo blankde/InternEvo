@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="./doc/imgs/InternEvo_logo.png" width="200"/>
+<img src="./doc/imgs/InternEvo_logo.png" width="800"/>
 
 [![使用文档](https://readthedocs.org/projects/internevo/badge/?version=latest)](https://internevo.readthedocs.io/zh_CN/latest/?badge=latest)
 [![license](./doc/imgs/license.svg)](./LICENSE)
@@ -116,7 +116,7 @@ $ torchrun --nnodes=1 --nproc_per_node=8 train.py --config ./configs/7B_sft.py -
 <div align="center">
   <b>InternEvo 特性列表</b>
 </div>
-<table align="center">
+<table>
   <tbody>
     <tr align="center" valign="bottom">
       <td>
@@ -143,6 +143,10 @@ $ torchrun --nnodes=1 --nproc_per_node=8 train.py --config ./configs/7B_sft.py -
       <ul>
         <li><a href="configs/_base_/models/internlm/internlm_7B.py">InternLM</a></li>
         <li><a href="configs/_base_/models/internlm/internlm2_7B.py">InternLM2</a></li>
+        <li><a href="configs/7B_llama2.py">Llama2</a></li>
+        <li><a href="configs/7B_qwen2.py">Qwen2</a></li>
+        <li><a href="configs/7B_baichuan2.py">Baichuan2</a></li>
+        <li><a href="configs/7B_gemma.py">gemma</a></li>
       </ul>
       </td>
       <td>
@@ -167,6 +171,31 @@ $ torchrun --nnodes=1 --nproc_per_node=8 train.py --config ./configs/7B_sft.py -
       </td>
     </tr>
 </td>
+    </tr>
+  </tbody>
+</table>
+
+## 常见tips
+
+<div align="center">
+</div>
+<table>
+  <tbody>
+    <tr align="center" valign="bottom">
+      <td>
+        <b>现象</b>
+      </td>
+      <td>
+        <b>介绍</b>
+      </td>
+    </tr>
+    <tr valign="bottom">
+      <td>
+        <b>在Vocab维度并行计算loss</b>
+      </td>
+      <td>
+        <b><a href="doc/parallel_output.md">说明</a></b>
+      </td>
     </tr>
   </tbody>
 </table>

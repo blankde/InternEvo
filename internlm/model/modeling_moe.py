@@ -9,7 +9,6 @@ from torch import nn
 
 from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
-from internlm.core.naive_amp import set_fp32_attr_to_module
 from internlm.initialize.initialize_tensor import normal_, scaled_init_method_normal
 from internlm.model.base_model import BaseModel
 from internlm.model.modules.embedding import Embedding1D
@@ -78,9 +77,12 @@ class Internlm1MoEDecoder(nn.Module):
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
-        num_experts: int = 1,
         mlp_layer_fusion: bool = False,
         multiple_of: int = 256,
+        num_experts: int = 1,
+        top_k: int = 1,
+        num_shared_experts: int = 0,
+        moe_layer_kwargs: dict = None,
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -116,7 +118,6 @@ class Internlm1MoEDecoder(nn.Module):
         self.norm2 = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
 
         self.num_experts = num_experts
-        ep_size = gpc.get_world_size(ParallelMode.EXPERT)
         if num_experts <= 1:  # dense, not MoE
             self.mlp = new_feed_forward(
                 hidden_size,
@@ -138,13 +139,16 @@ class Internlm1MoEDecoder(nn.Module):
                 int(hidden_size * mlp_ratio),
                 out_features=hidden_size,
                 num_experts=num_experts,
-                ep_group=gpc.get_group(ParallelMode.EXPERT),
-                ep_size=ep_size,
+                top_k=top_k,
+                num_shared_experts=num_shared_experts,
+                moe_layer_kwargs=moe_layer_kwargs,
                 device=device,
                 dtype=dtype,
+                mlp_layer_fusion=mlp_layer_fusion,
+                multiple_of=multiple_of,
+                # TODO: to support more activation functions
+                activation_type="swiglu" if use_swiglu else "swiglu",
             )
-            # TODO: remove from model package.
-            set_fp32_attr_to_module(self.mlp.moe_layer.gate)
 
         self.use_swiglu = use_swiglu
         self.use_scaled_init = use_scaled_init
@@ -304,11 +308,13 @@ class Internlm1MoE(BaseModel):
         dropout_selective_checkpoint: bool = True,
         use_scaled_init: bool = True,
         use_swiglu: bool = True,
-        num_experts: bool = 1,
-        moe_use_residual: bool = False,  # pylint: disable=W0613
-        moe_type: str = None,  # pylint: disable=W0613
         mlp_layer_fusion: bool = False,
         multiple_of: int = 256,
+        moe_type: str = None,  # pylint: disable=W0613
+        num_experts: bool = 1,
+        top_k: int = 1,
+        num_shared_experts: int = 0,
+        moe_layer_kwargs: dict = None,
     ):
         super().__init__()
 
@@ -341,9 +347,12 @@ class Internlm1MoE(BaseModel):
                     use_scaled_init=use_scaled_init,
                     use_swiglu=use_swiglu,
                     qk_interleaved=qk_interleaved,
-                    num_experts=num_experts,
                     mlp_layer_fusion=mlp_layer_fusion,
                     multiple_of=multiple_of,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_shared_experts=num_shared_experts,
+                    moe_layer_kwargs=moe_layer_kwargs,
                 )
                 for lid in range(num_layers)
             ]

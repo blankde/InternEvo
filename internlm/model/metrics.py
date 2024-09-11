@@ -3,13 +3,11 @@ from typing import Callable, List, Optional
 import torch
 
 from internlm.accelerator import AcceleratorType, get_accelerator
-from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.ops.cross_entropy import new_cross_entropy
 from internlm.utils.common import SchedulerHook, get_current_device
 from internlm.utils.logger import get_logger
 from internlm.utils.megatron_timers import megatron_timer as timer
-from internlm.utils.parallel import is_using_isp
 
 try:
     from torch_scatter import scatter as cuda_scatter
@@ -116,10 +114,10 @@ class AccPerplex:
 
     def set_current_type_ids(self, type_ids: torch.Tensor):
         self.batch_shift = 0
-        if is_using_isp() and gpc.config.model.parallel_output:
-            step_seqlen = type_ids.shape[-1] // gpc.get_world_size(ParallelMode.TENSOR)
-            sp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
-            type_ids = type_ids[..., step_seqlen * sp_rank : step_seqlen * (sp_rank + 1)]
+        # if is_using_isp() and gpc.config.model.parallel_output:
+        #     step_seqlen = type_ids.shape[-1] // gpc.get_world_size(ParallelMode.TENSOR)
+        #     sp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
+        #     type_ids = type_ids[..., step_seqlen * sp_rank : step_seqlen * (sp_rank + 1)]
         self.type_ids = type_ids.to(get_current_device())
 
     def set_cu_seqlens(self, cu_seqlens: List):
@@ -302,10 +300,10 @@ class LossWithTypeId:
             loss_list = self.loss_fn(logits, labels)
 
             # get current rank part loss_list
-            if is_using_isp() and gpc.config.model.parallel_output:
-                step_seqlen = logits.shape[0]
-                sp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
-                loss_list = loss_list[step_seqlen * sp_rank : step_seqlen * (sp_rank + 1)]
+            # if is_using_isp() and gpc.config.model.parallel_output:
+            #     step_seqlen = logits.shape[0]
+            #     sp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
+            #     loss_list = loss_list[step_seqlen * sp_rank : step_seqlen * (sp_rank + 1)]
 
             cond = labels != -100
             real_loss_list = loss_list[cond]

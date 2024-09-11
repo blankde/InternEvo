@@ -7,8 +7,9 @@ import torch
 from torch import nn
 
 from internlm.model.modules.linear import new_linear
-from internlm.model.modules.utils import Silu
+from internlm.model.modules.utils import Gelu, Silu
 from internlm.utils.logger import get_logger
+from internlm.utils.utils import ActivationType
 
 logger = get_logger(__file__)
 
@@ -72,10 +73,13 @@ class FeedForward(nn.Module):
     ):
         super().__init__()
 
-        # TODO: support gelu...
-        assert activation_type in ("swiglu"), f"Unsupported activation type: {activation_type}"
+        assert activation_type in (
+            ActivationType.swiglu.name,
+            ActivationType.gelu.name,
+        ), f"Unsupported activation type: {activation_type}"
 
         self.mlp_layer_fusion = mlp_layer_fusion
+        self.activation_type = activation_type
 
         hidden_features = multiple_of * ((hidden_features + multiple_of - 1) // multiple_of)
 
@@ -109,7 +113,12 @@ class FeedForward(nn.Module):
         else:
             fussed_out = self.fused_w1_w3(x)
             w1_o, w3_o = torch.split(fussed_out, fussed_out.shape[-1] // 2, dim=-1)
-        out = self.w2(Silu(w1_o, w3_o))
+
+        if self.activation_type is ActivationType.swiglu.name:
+            out = self.w2(Silu(w1_o, w3_o))
+        else:
+            out = self.w2(Gelu(w1_o, w3_o))
+
         return out
 
 

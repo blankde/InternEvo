@@ -1,36 +1,35 @@
-JOB_NAME = "7b_moe_train"
+JOB_NAME = "7b_baichuan2_train"
+model_type = "BAICHUAN2"
 DO_ALERT = False
 
+VOCAB_SIZE = 125696
 SEQ_LEN = 2048
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
-MLP_RATIO = 4 / 3
+MLP_RATIO = 8 / 3
 NUM_LAYER = 32
-VOCAB_SIZE = 103168
 
-MODEL_ONLY_FOLDER = "local:llm_ckpts/xxxx"
+
+MODEL_ONLY_FOLDER = "local:llm_ckpts_baichuan2/xxxx"
 # Ckpt folder format:
 # fs: 'local:/mnt/nfs/XXX'
-SAVE_CKPT_FOLDER = "local:llm_ckpts"
-LOAD_CKPT_FOLDER = "local:llm_ckpts/49"
+SAVE_CKPT_FOLDER = "local:llm_ckpts_baichuan2"
 
 # boto3 Ckpt folder format:
 # import os
 # BOTO3_IP = os.environ["BOTO3_IP"] # boto3 bucket endpoint
 # SAVE_CKPT_FOLDER = f"boto3:s3://model_weights.{BOTO3_IP}/internlm"
-# LOAD_CKPT_FOLDER = f"boto3:s3://model_weights.{BOTO3_IP}/internlm/snapshot/1/"
 CHECKPOINT_EVERY = 50
 ckpt = dict(
     enable_save_ckpt=False,  # enable ckpt save.
+    enable_internevo2hf_ckpt=False, # enable ckpt save for huggingface format.
     save_ckpt_folder=SAVE_CKPT_FOLDER,  # Path to save training ckpt.
-    # load_ckpt_folder= dict(path=MODEL_ONLY_FOLDER, content=["model"], ckpt_type="normal"),
-    load_ckpt_folder="local:llm_ckpts/",
     # 'load_ckpt_info' setting guide:
     # 1. the 'path' indicate ckpt path,
     # 2. the 'content‘ means what states will be loaded, support: "model", "sampler", "optimizer", "scheduler", "all"
     # 3. the ’ckpt_type‘ means the type of checkpoint to be loaded, support: "internevo", "hf", or other custom-defined
     # load function such as "llama"
-    load_ckpt_info=dict(path=MODEL_ONLY_FOLDER, content=("model",), ckpt_type="internevo"),
+    load_ckpt_info=dict(path=MODEL_ONLY_FOLDER, content=("model",), ckpt_type="hf"),
     # 'auto_resume' is designed to automatically load the latest checkpoint from 'save_ckpt_folder' when encountering
     # training interruptions/hangs caused by hardware failures, using a scheduling system (such as k8s/slurm)
     # with an automatic restart mechanism upon training reboot.
@@ -38,27 +37,27 @@ ckpt = dict(
     # path specified in `load_ckpt_info` by default.
     # If you want to initialize your model weights from another model, you must set `auto_resume` to False.
     # If you want to train from scratch, please set `auto_resume` to False and 'load_ckpt_info' to None.
-    auto_resume=True,
+    auto_resume=False,
     checkpoint_every=CHECKPOINT_EVERY,
     async_upload=True,  # async ckpt upload. (only work for boto3 ckpt)
     async_upload_tmp_folder="/dev/shm/internlm_tmp_ckpt/",  # path for temporarily files during asynchronous upload.
     oss_snapshot_freq=int(CHECKPOINT_EVERY / 2),  # snapshot ckpt save frequency.
 )
 
-TRAIN_FOLDER = None  # "/path/to/dataset"
+TRAIN_FOLDER = None
 VALID_FOLDER = None  # "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
     micro_num=4,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=2,
+    micro_bsz=1,
     # defaults to the value of micro_num
     valid_micro_num=4,
     # defaults to 0, means disable evaluate
-    valid_every=50,
+    valid_every=0,
     pack_sample_into_one=False,
-    total_steps=50000,
+    total_steps=20,
     skip_batches="",
     # rampup_batch_size (str): A string with three space-separated integers representing the
     #       starting batch size, the increment, and the number of steps between
@@ -95,7 +94,7 @@ grad_scaler = dict(
 
 hybrid_zero_optimizer = dict(
     # Enable low_level_optimzer overlap_communication
-    overlap_sync_grad=False,
+    overlap_sync_grad=True,
     overlap_sync_param=False,
     # bucket size for nccl communication params
     reduce_bucket_size=512 * 1024 * 1024,
@@ -105,7 +104,6 @@ hybrid_zero_optimizer = dict(
 
 loss = dict(
     label_smoothing=0,
-    moe_loss_coeff=0.1,
 )
 
 adam = dict(
@@ -133,7 +131,8 @@ beta2_scheduler = dict(
 
 use_fp32_norm = False
 model = dict(
-    checkpoint=False,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
+    checkpoint=False,
+    num_chunks=1,
     num_attention_heads=NUM_ATTENTION_HEAD,
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
@@ -141,11 +140,12 @@ model = dict(
     parallel_output=True,
     hidden_size=HIDDEN_SIZE,
     num_layers=NUM_LAYER,
+    no_bias=True,
     mlp_ratio=MLP_RATIO,
     apply_post_layer_norm=False,
-    dtype="torch.bfloat16",  # Support: "torch.float16", "torch.half", "torch.bfloat16", "torch.float32", "torch.tf32"
+    dtype="torch.bfloat16",
     norm_type="rmsnorm",
-    layer_norm_epsilon=1e-5,
+    layer_norm_epsilon=1e-6,
     use_flash_attn=True,
     # Whether the odd and even columns of the query and key in the model are normally interleaved.
     # If it's True, the model's odd and even columns are normally ordered; if it's False,
@@ -155,11 +155,8 @@ model = dict(
     # qk_interleaved = True: q[-1] = [q1,q2,q3,q4,q5,q6,...], k[-1] = [k1,k2,k3,k4,k5,k6,...]
     # qk_interleaved = False: q[-1] = [q1,q3,q5,...,q2,q4,q6,...], k[-1] = [k1,k3,k5,...,k2,k4,k6,...]
     qk_interleaved=False,
-    num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
-    moe_type="GShard",  # Support: "GShard", "MegaBlock", "MegaBlock-D", "Dropless"
-    num_experts=4,
-    top_k=2,
 )
+
 """
 zero1 parallel (dict):
     1. size: int
@@ -184,25 +181,12 @@ weight parallel (dict):
     1. size: int, the size of weight parallel.
     2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
     3. memory_pool: bool, enable/disable memory pool, defaults to False.
-expert parallel (dict):
-    1. size: int
-        * if size <= 0, ep size equals to dp size, but if the number of experts is smaller than dp size, set ep size
-            to be the number of experts to make sure each device has one expert.
-        * if size == 1, all experts are placed in each device, running as dp-only.
-        * if size > 1, all experts are placed in k devices and each device has n/k experts, where n is the total
-            number of experts and k = size.
-expert weight parallel (dict):
-    1. size: int, the size of weight parallel for expert module, distinct with global weight parallel size.
-    2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
-    3. memory_pool: bool, enable/disable memory pool, defaults to False.
 """
 parallel = dict(
-    zero1=dict(size=-1, fsdp=False),
+    zero1=dict(size=-1),
     tensor=dict(size=1, mode="mtp"),
     pipeline=dict(size=1, interleaved_overlap=True),
     weight=dict(size=1, overlap=True, memory_pool=True),
-    expert=dict(size=-1, no_tp=False),
-    expert_weight=dict(size=1, overlap=True, memory_pool=True),
 )
 
 cudnn_deterministic = False
@@ -221,17 +205,21 @@ monitor = dict(
     ),
 )
 
-
-# MegaBlock MoE config
-# moe = dict(
-#    top_k=2,
-#    capacity_factor=1.0, # only used in MegaBlock(non-dmoe)
-#    drop_tokens=True, # only used in MegaBlock(non-dmoe)
-#    #parallel_mode="tensor", # only used in MegaBlock-D(dmoe), parallel_mode can be tensor or weight
-# )
-
-model_type = "INTERNLM_MoE"
-
 # metric_dtype can be "fp32" or other string
 # only when set to "fp32" will use fp32 to calc in metrics
 # metric_dtype = "fp32"
+
+generation = dict(
+    ckpt_folder="/path/to/saved/ckpt",
+    output_folder="/path/to/save/generation",
+    batch_size=1,
+    eos_id=[2, 0],
+    bos_id=1,
+    max_length=100,
+    do_sample=True,
+    temperature=1.0,
+    top_k=50,
+    top_p=1.0,
+    repetition_penalty=1,
+    length_penalty=1.0,
+)

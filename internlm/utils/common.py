@@ -96,10 +96,10 @@ def check_data_is_packed(data):
         return False
     elif isinstance(data, (list, tuple)):
         if isinstance(data[0], dict):
-            return "indexes" in data[0]
+            return "cu_seqlens" in data[0]
         return False
     elif isinstance(data, dict):
-        return "indexes" in data[0]
+        return "cu_seqlens" in data[0]
 
 
 def filter_kwargs(func, kwargs):

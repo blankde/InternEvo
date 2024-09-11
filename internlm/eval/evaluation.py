@@ -7,9 +7,11 @@ from tqdm import tqdm
 from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.core.parallel.shard import split_data_for_sequence_parallel
 from internlm.core.scheduler.pipeline_scheduler import get_tensor_shape
 from internlm.model.metrics import AccPerplex, SchedulerMetricHook
 from internlm.utils.common import get_current_device
+from internlm.utils.parallel import is_using_isp
 
 internlm_accelerator = get_accelerator()
 
@@ -32,7 +34,29 @@ def switch_evaluation_mode(trainer, metric_hook_list):
     prev_metric_hooks = trainer.schedule._hooks
     try:
         gpc.is_evaluating = True
-        trainer.schedule.data_process_func = None
+
+        data_fns = []
+
+        def add_indexes_to_data(data, label):
+            _indexes = torch.arange(gpc.config.data.seq_len, dtype=torch.int32).to(get_current_device())
+            assert "indexes" not in data
+            data["indexes"] = _indexes
+            data["max_seqlen"] = gpc.config.data.seq_len
+
+            return data, label
+
+        # support sequence parallel for isp
+        if is_using_isp():
+            data_fns.append(add_indexes_to_data)
+            data_fns.append(split_data_for_sequence_parallel)
+
+        def _data_preparation_func(_data, _label):
+            for fn in data_fns:
+                _data, _label = fn(_data, _label)
+
+            return _data, _label
+
+        trainer.schedule.data_process_func = _data_preparation_func
         trainer.schedule._hooks = metric_hook_list
 
         yield

@@ -345,10 +345,16 @@ def args_sanity_check():
     if "MoE" in gpc.config.get("model_type", ModelType.INTERNLM.name):
         if "num_experts" not in model:
             model._add_item("num_experts", 1)
-        if "moe_use_residual" not in model:
-            model._add_item("moe_use_residual", False)
+        if "top_k" not in model:
+            model.top_k = 1
+        if "num_shared_experts" not in model:
+            model.num_shared_experts = 1 if getattr(model, "moe_use_residual", False) else 0
+            if hasattr(model, "moe_use_residual"):
+                delattr(model, "moe_use_residual")
         if "moe_type" not in model:
             model._add_item("moe_type", "GShard")
+        if "moe_layer_kwargs" not in model:
+            model.moe_layer_kwargs = {}
 
     if "mlp_layer_fusion" not in model:
         model._add_item("mlp_layer_fusion", False)

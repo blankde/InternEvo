@@ -52,10 +52,16 @@ def unpack_type_ids(type_ids, cu_seqlens):
 def unpack_data(data, label):
 
     data["input_ids"] = _unpack_data(data["input_ids"], data["cu_seqlens"], padding_v=0).squeeze(0)
+    data["indexes"] = _unpack_data(data["indexes"], data["cu_seqlens"], padding_v=0).squeeze(0)
     label = _unpack_data(label, data["cu_seqlens"], padding_v=-100).squeeze(0)
 
+    data["max_seqlen"] = gpc.config.data.seq_len
+
     data.pop("cu_seqlens")
-    data.pop("indexes")
+    # indexes will be used in rotary emb when using isp and sp_size > 1
+    # data.pop("indexes")
+    # per batch's index should be equal, so we select first batch
+    data["indexes"] = data["indexes"][0]
 
     return data, label
 

@@ -9,7 +9,7 @@ from torch import nn
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
-from internlm.core.parallel.comm.utils import _split
+from internlm.core.parallel.comm.utils import _gather, _split
 from internlm.utils.logger import get_logger
 from internlm.utils.utils import TensorParallelMode
 
@@ -39,8 +39,8 @@ def _split_data_for_sequence_parallel(data, label):
 
     data["input_ids"] = _split(data["input_ids"], ParallelMode.TENSOR, dim=_seq_dim)
 
-    if gpc.config.model.parallel_output:
-        label = _split(label, ParallelMode.TENSOR, dim=_seq_dim)
+    # if gpc.config.model.parallel_output:
+    #     label = _split(label, ParallelMode.TENSOR, dim=_seq_dim)
 
     return data, label
 
@@ -49,7 +49,7 @@ def _split_data_for_2D_sequence_parallel(data, label):
     if gpc.config.parallel.sequence_2D.enable is False or gpc.get_world_size(ParallelMode.TENSOR) <= 1:
         return data, label
 
-    assert len(data.keys()) == 1 and "input_ids" in data
+    assert len(data.keys()) == 3 and "input_ids" in data and "indexes" in data and "max_seqlen" in data
 
     sp_size = gpc.get_world_size(ParallelMode.TENSOR)
     hp_size = gpc.get_world_size(ParallelMode.HEAD)
@@ -59,12 +59,18 @@ def _split_data_for_2D_sequence_parallel(data, label):
     stride = 2
 
     assert len(data["input_ids"].shape) == 2
+    assert len(data["indexes"].shape) == 1
     assert len(label.shape) == 2
     seq_dim = 1
     data["input_ids"] = data["input_ids"].view(
         *data["input_ids"].shape[0:seq_dim],
         2 * sp_size,
         data["input_ids"].shape[seq_dim] // (2 * sp_size),
+    )
+    _index_seq_dim = 0
+    data["indexes"] = data["indexes"].view(
+        2 * sp_size,
+        data["indexes"].shape[_index_seq_dim] // (2 * sp_size),
     )
     label = label.view(
         *label.shape[0:seq_dim],
@@ -108,8 +114,15 @@ def _split_data_for_2D_sequence_parallel(data, label):
     data["input_ids"] = data["input_ids"].view(
         *data["input_ids"].shape[0:seq_dim], -1, *data["input_ids"].shape[(seq_dim + 2) :]
     )
+    data["indexes"] = data["indexes"].index_select(_index_seq_dim, index)
+    data["indexes"] = data["indexes"].view(
+        *data["indexes"].shape[0:_index_seq_dim], -1, *data["indexes"].shape[(_index_seq_dim + 2) :]
+    )
     label = label.index_select(seq_dim, index)
     label = label.view(*label.shape[0:seq_dim], -1, *label.shape[(seq_dim + 2) :])
+
+    # if gpc.config.model.parallel_output is False:
+    label = _gather(label, ParallelMode.TENSOR, dim=seq_dim)
 
     return data, label
 

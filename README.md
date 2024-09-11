@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="./doc/imgs/InternEvo_logo.png" width="200"/>
+<img src="./doc/imgs/InternEvo_logo.png" width="800"/>
 
 [![Documentation Status](https://readthedocs.org/projects/internevo/badge/?version=latest)](https://internevo.readthedocs.io/zh_CN/latest/?badge=latest)
 [![license](./doc/imgs/license.svg)](./LICENSE)
@@ -116,7 +116,7 @@ Please refer to the [System Architecture document](./doc/en/structure.md) for ar
 <div align="center">
   <b>InternEvo Feature Zoo</b>
 </div>
-<table align="center">
+<table>
   <tbody>
     <tr align="center" valign="bottom">
       <td>
@@ -143,6 +143,10 @@ Please refer to the [System Architecture document](./doc/en/structure.md) for ar
       <ul>
         <li><a href="configs/_base_/models/internlm/internlm_7B.py">InternLM</a></li>
         <li><a href="configs/_base_/models/internlm/internlm2_7B.py">InternLM2</a></li>
+        <li><a href="configs/7B_llama2.py">Llama2</a></li>
+        <li><a href="configs/7B_qwen2.py">Qwen2</a></li>
+        <li><a href="configs/7B_baichuan2.py">Baichuan2</a></li>
+        <li><a href="configs/7B_gemma.py">gemma</a></li>
       </ul>
       </td>
       <td>
@@ -167,6 +171,31 @@ Please refer to the [System Architecture document](./doc/en/structure.md) for ar
       </td>
     </tr>
 </td>
+    </tr>
+  </tbody>
+</table>
+
+## Common Tips
+
+<div align="center">
+</div>
+<table>
+  <tbody>
+    <tr align="center" valign="bottom">
+      <td>
+        <b>Item</b>
+      </td>
+      <td>
+        <b>Introduction</b>
+      </td>
+    </tr>
+    <tr valign="bottom">
+      <td>
+        <b>Parallel Computing Loss</b>
+      </td>
+      <td>
+        <b><a href="doc/en/parallel_output.md">link</a></b>
+      </td>
     </tr>
   </tbody>
 </table>

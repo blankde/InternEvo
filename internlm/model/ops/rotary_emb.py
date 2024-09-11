@@ -107,6 +107,7 @@ def _apply_torch_npu_rotary_mul(x: Tensor, cos: Tensor, sin: Tensor):
         cos (Tensor): cos, shape is [1, S, 1, D].
         sin (Tensor): sin, shape is [1, S, 1, D].
     """
+
     # NOTE: This could probably be moved to Triton.
     def rotate_half(_x):
         x1, x2 = _x.chunk(2, dim=-1)

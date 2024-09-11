@@ -1,12 +1,13 @@
-from typing import Optional
-
 import torch
 
+from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
+from internlm.core.naive_amp import set_fp32_attr_to_module
 from internlm.model.modules.mlp import new_feed_forward
-from internlm.model.moe.gshard_layer import GShardMOELayer
-from internlm.model.moe.megablock.megablock_dmoe import MegaBlockdMoE
-from internlm.model.moe.megablock.megablock_moe import MegaBlockMoE
+from internlm.model.moe.dropless_layer import DroplessMoELayer
+from internlm.model.moe.gshard_layer import GShardMoELayer
+from internlm.model.moe.megablocks.megablock_dmoe import MegaBlockdMoE
+from internlm.model.moe.megablocks.megablock_moe import MegaBlockMoE
 from internlm.utils.logger import get_logger
 
 # global llm logger
@@ -15,10 +16,12 @@ logger = get_logger(__file__)
 
 def new_moe_layer(moe_type: str, **kwargs):
     if moe_type == "GShard":
-        return GShardMOELayer(**kwargs)
+        return GShardMoELayer(**kwargs)
+    elif moe_type == "Dropless":
+        return DroplessMoELayer(**kwargs)
     elif moe_type == "MegaBlock":
         return MegaBlockMoE(**kwargs)
-    elif moe_type == "MegaBlock-D":
+    elif moe_type == "MegaBlock-Dropless":
         return MegaBlockdMoE(**kwargs)
     else:
         raise ValueError(f"Unsupported model type: {moe_type}")
@@ -51,18 +54,24 @@ class MoE(torch.nn.Module):
         in_features: int,
         hidden_features: int,
         out_features: int,
-        ep_group: Optional[torch.distributed.ProcessGroup],
         num_experts: int = 1,
-        ep_size=1,
-        use_residual: bool = False,
+        top_k: int = 1,
+        num_shared_experts: int = 0,
+        moe_layer_kwargs=None,
         device=None,
         dtype=None,
+        mlp_layer_fusion: bool = False,
+        multiple_of: int = 256,
+        activation_type: str = "swiglu",
     ):
 
         super().__init__()
 
-        if not hasattr(gpc.config, "moe"):
-            gpc.config.moe = dict()
+        if moe_layer_kwargs is None:
+            moe_layer_kwargs = dict()
+
+        ep_group = gpc.get_group(ParallelMode.EXPERT)
+        ep_size = gpc.get_world_size(ParallelMode.EXPERT)
 
         self.moe_layer = new_moe_layer(
             moe_type=gpc.config.model.moe_type,
@@ -70,23 +79,31 @@ class MoE(torch.nn.Module):
             hidden_features=hidden_features,
             out_features=out_features,
             num_experts=num_experts,
+            top_k=top_k,
             ep_group=ep_group,
             ep_size=ep_size,
             device=device,
             dtype=dtype,
-            **(gpc.config.moe),
+            mlp_layer_fusion=mlp_layer_fusion,
+            multiple_of=multiple_of,
+            activation_type=activation_type,
+            **moe_layer_kwargs,
         )
+        set_fp32_attr_to_module(self.moe_layer.gate)
 
         # residual network, see https://arxiv.org/pdf/2201.05596.pdf, seems useful for convergence
-        self.use_residual = use_residual
-        if self.use_residual:
+        self.num_shared_experts = num_shared_experts
+        if self.num_shared_experts > 0:
             self.residual_mlp = new_feed_forward(
                 in_features=in_features,
-                hidden_features=hidden_features,
+                hidden_features=int(hidden_features * num_shared_experts),
                 out_features=out_features,
                 bias=False,
                 device=device,
                 dtype=dtype,
+                mlp_layer_fusion=mlp_layer_fusion,
+                multiple_of=multiple_of,
+                activation_type=activation_type,
             )
             # coefficient is used for weighted sum of the output of expert and residual mlp
             self.coefficient = torch.nn.Linear(in_features, 2)
@@ -108,7 +125,7 @@ class MoE(torch.nn.Module):
             * exp_counts (int): expert count
         """
         output = self.moe_layer(hidden_states, used_token)
-        if self.use_residual:
+        if self.num_shared_experts > 0:
             # Residual MoE
             output_mlp = self.residual_mlp(hidden_states)
             if isinstance(output_mlp, tuple):
