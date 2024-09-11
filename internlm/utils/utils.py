@@ -50,6 +50,7 @@ class ModelType(Enum):
     QWEN2 = 6
     BAICHUAN2 = 7
     GEMMA = 8
+    GPT567B = 9
 
 
 class DataType(Enum):

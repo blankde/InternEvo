@@ -486,6 +486,7 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
         dtype: Optional[torch.dtype] = None,
         weight_scale: int = 1,
         norm_head: bool = False,
+        skip_weight_alloction: bool = False,
     ) -> None:
         if norm_head:
             logger.info("Notice that norm head is enabled to normalize head weight.")
@@ -500,14 +501,22 @@ class ScaleColumnParallelLinear(ParallelLinearWithCommExt):
         self.first_eval_flag = True
         self.tmp_weight = None
 
-    def forward(self, input):  # pylint: disable=W0622
+        if skip_weight_alloction:
+            del self.weight
+            self.register_parameter("weight", None)
+
+    def forward(self, input, shared_weight: Optional[torch.Tensor] = None):  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
 
-        if self.weight_scale == 1:
-            weight = self.weight
+        if shared_weight is None:
+            if self.weight is None:
+                raise RuntimeError("weight was not given in forward pass and skip_weight_allocation is True.")
+            shared_weight = self.weight
+        if self.weight_scale != 1:
+            weight = shared_weight * self.weight_scale + (1 - self.weight_scale) * shared_weight.detach()
         else:
-            weight = self.weight * self.weight_scale + (1 - self.weight_scale) * self.weight.detach()
+            weight = shared_weight
 
         if self.norm_head:
             if self.training:
@@ -606,6 +615,7 @@ def new_linear(
                 weight_scale,
             )
         else:
+            skip_weight_alloction = kwargs.get("skip_weight_alloction", False)
             return ScaleColumnParallelLinear(
                 in_features,
                 out_features,
@@ -614,6 +624,7 @@ def new_linear(
                 dtype,
                 weight_scale=weight_scale,
                 norm_head=norm_head,
+                skip_weight_alloction=skip_weight_alloction,
             )
     elif split_mode == "column":
         return ColumnParallelLinear(
