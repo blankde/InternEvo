@@ -153,12 +153,12 @@ class _GatherFromSequenceParallelRegionToMOE(torch.autograd.Function):
         return _gather_along_first_dim_moe(input_)
 
     @staticmethod
-    def forward(ctx, input_):
+    def forward(ctx, input_):  # pylint: disable=W0613
         """Forward function."""
         return _gather_along_first_dim_moe(input_)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=W0613
         """Backward function."""
         return _reduce_scatter_along_first_dim_moe(grad_output), None
 
@@ -172,12 +172,12 @@ class _ReduceScatterToSequenceParallelRegionFromMOE(torch.autograd.Function):
         return _reduce_scatter_along_first_dim_moe(input_)
 
     @staticmethod
-    def forward(ctx, input_):
+    def forward(ctx, input_):  # pylint: disable=W0613
         """Forward function."""
         return _reduce_scatter_along_first_dim_moe(input_)
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pylint: disable=W0613
         """Backward function."""
         return _gather_along_first_dim_moe(grad_output), None
 
