@@ -263,7 +263,7 @@ def train(
         timer("fwd-bwd").stop()
 
         if isp_communicator and isp_communicator.enable_memory_pool:
-            isp_communicator.memory_pool.reset_lazy_pools()
+            isp_communicator.reset_lazy_pools()
 
         # update parameters, and returns (success_update, grad_norm)
         trainer_result = trainer.step()
