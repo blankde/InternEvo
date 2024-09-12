@@ -490,6 +490,9 @@ class GPTMoE(BaseModel):
         if gpc.get_world_size(ParallelMode.PIPELINE) == 1:
             return
 
+        if gpc.is_pipeline_first_stage():
+            self.shared_embedding_weight().shared_embedding = True
+
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
         # one stage, the initial embedding layer and the head are on different
@@ -510,6 +513,7 @@ class GPTMoE(BaseModel):
                 num_embeddings=vocab_size, embedding_dim=hidden_size, vocab_parallel=True, device=device
             )
             self.shared_embedding_weight().data.fill_(0)
+            self.shared_embedding_weight().shared_embedding = True
 
         # Ensure that first and last stages have the same initial parameter
         # values.

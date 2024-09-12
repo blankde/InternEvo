@@ -4,7 +4,6 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 
-import torch
 import torch.distributed as dist
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -94,7 +93,4 @@ class EmbeddingSharedModuleGradientHandler(BaseGradientHandler):
         if gpc.is_pipeline_first_stage() or gpc.is_pipeline_last_stage():
             weight = self._model.model.shared_embedding_weight()
             grad = weight.grad
-            # enable zero will cause grad to be None
-            if grad is None:
-                grad = torch.zeros_like(weight)
             dist.all_reduce(grad, group=gpc.get_group(parallel_mode=ParallelMode.EMBEDDING_HEAD))

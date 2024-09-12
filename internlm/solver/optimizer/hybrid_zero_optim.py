@@ -652,7 +652,7 @@ class HybridZeroOptimizer(BaseOptimizer):
             grads = [self.padding_grad.to(dtype)]
             params = [self.padding_tensor.to(dtype)]
 
-            if self.optim.param_groups[group_id]["name"] == "default":
+            if self.optim.param_groups[group_id]["name"] in ("default", "embed_head"):
                 for param in params:
                     if self.use_isp:
                         setattr(param, IS_WEIGHT_ZERO_PARALLEL, True)

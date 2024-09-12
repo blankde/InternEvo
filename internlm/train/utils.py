@@ -44,6 +44,11 @@ def split_params_into_different_groups_for_optimizer(
     new_groups = {}
     # create new groups for fp32 parameter group
     new_groups["fp32"] = {"name": "fp32", "params": [], "optimizer_mode": ParallelMode.ZERO1}
+    # create separate embed_head group to ensure the param are partitioned in the same way
+    if gpc.config.model.get("tie_embeddings_and_output_weights", False) and gpc.is_using_parallel_mode(
+        ParallelMode.PIPELINE
+    ):
+        new_groups["embed_head"] = {"name": "embed_head", "params": [], "optimizer_mode": ParallelMode.DATA}
 
     if gpc.config.model.get("num_experts", 1) > 1:
         for key in gpc.expert_parallel_group_names:
@@ -59,8 +64,10 @@ def split_params_into_different_groups_for_optimizer(
         # assign param
         origin_params = []
         for param in pgroup["params"]:
+            if getattr(param, "shared_embedding", False):
+                new_groups["embed_head"]["param"].append(param)
             # moe param means MoE is enabled
-            if is_moe_param(param):
+            elif is_moe_param(param):
                 new_groups[param.group_name]["params"].append(param)
             elif param.dtype == torch.float32 and gpc.config.model.dtype != torch.float32:
                 new_groups["fp32"]["params"].append(param)
