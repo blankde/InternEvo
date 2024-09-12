@@ -445,7 +445,7 @@ class GPTMoE(BaseModel):
         # old condition may fail when use shared embedding
         if gpc.is_pipeline_first_stage() and input_ids is not None:
             tok_embeddings = self.embedding(input_ids)
-            pos_embeddings = self.position_embeddings(input_ids)
+            pos_embeddings = self.position_embeddings(kwargs["indexes"])
             hidden_states = tok_embeddings + pos_embeddings
             if self.embed_grad_scale != 1:
                 hidden_states = (
