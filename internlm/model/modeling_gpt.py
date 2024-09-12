@@ -381,7 +381,7 @@ class GPTMoE(BaseModel):
             )
 
             self.position_embeddings = Embedding1D(
-                num_embeddings=vocab_size, embedding_dim=hidden_size, vocab_parallel=True, device=device
+                num_embeddings=max_position_embeddings, embedding_dim=hidden_size, vocab_parallel=True, device=device
             )
 
             for param in self.position_embeddings.parameters():
