@@ -380,7 +380,9 @@ class GPTMoE(BaseModel):
                 num_embeddings=vocab_size, embedding_dim=hidden_size, vocab_parallel=True, device=device
             )
 
-            self.position_embeddings = torch.nn.Embedding(max_position_embeddings, hidden_size)
+            self.position_embeddings = Embedding1D(
+                num_embeddings=vocab_size, embedding_dim=hidden_size, vocab_parallel=True, device=device
+            )
 
             for param in self.position_embeddings.parameters():
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
@@ -445,7 +447,7 @@ class GPTMoE(BaseModel):
         # old condition may fail when use shared embedding
         if gpc.is_pipeline_first_stage() and input_ids is not None:
             tok_embeddings = self.embedding(input_ids)
-            pos_embeddings = self.position_embeddings(kwargs["indexes"])
+            pos_embeddings = self.position_embeddings(kwargs["indexes"].view(input_ids.shape))
             hidden_states = tok_embeddings + pos_embeddings
             if self.embed_grad_scale != 1:
                 hidden_states = (
