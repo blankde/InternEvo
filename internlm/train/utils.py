@@ -65,7 +65,7 @@ def split_params_into_different_groups_for_optimizer(
         origin_params = []
         for param in pgroup["params"]:
             if getattr(param, "shared_embedding", False):
-                new_groups["embed_head"]["param"].append(param)
+                new_groups["embed_head"]["params"].append(param)
             # moe param means MoE is enabled
             elif is_moe_param(param):
                 new_groups[param.group_name]["params"].append(param)
