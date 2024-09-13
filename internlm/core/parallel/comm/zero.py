@@ -224,12 +224,10 @@ class ParamAsyncBcastHandlerWrapper:
         idx = CommunicatorType.MoE if is_moe_param(param) else CommunicatorType.Non_MoE
         return self.get_handle(idx).get_rank_by_param(param)
 
-    def add_bcast_handle(self, rank, handle, is_moe_group=False) -> None:
-        idx = CommunicatorType.MoE if is_moe_group else CommunicatorType.Non_MoE
+    def add_bcast_handle(self, rank, handle, bcast_mode) -> None:
+        idx = CommunicatorType.MoE if bcast_mode == ParallelMode.EXPERT_DATA else CommunicatorType.Non_MoE
         self.get_handle(idx).add_bcast_handle(rank, handle)
 
-    def add_allgather_handle(
-        self, handle, master_param, working_param, gatherd_param, block_name, is_moe_group=False
-    ) -> None:
-        idx = CommunicatorType.MoE if is_moe_group else CommunicatorType.Non_MoE
+    def add_allgather_handle(self, handle, master_param, working_param, gatherd_param, block_name, bcast_mode) -> None:
+        idx = CommunicatorType.MoE if bcast_mode == ParallelMode.EXPERT_DATA else CommunicatorType.Non_MoE
         self.get_handle(idx).add_allgather_handle(handle, master_param, working_param, gatherd_param, block_name)
