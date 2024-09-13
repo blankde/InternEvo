@@ -18,6 +18,7 @@ from internlm.core.naive_amp import unwrap_naive_amp
 from internlm.core.parallel.comm.utils import (
     DUMMY_HANDLE_CONST,
     AsyncCommHandle,
+    CommunicatorType,
     _gather,
     _split,
     all_gather_raw,
@@ -832,9 +833,8 @@ class ISPCommunicatorWrapper:
 
     def __init__(
         self,
-        isp_communicators: List[ISPCommunicator],
     ) -> None:
-        self.isp_communicators = isp_communicators
+        self.isp_communicators = [None for _ in range(len(CommunicatorType))]
         self.reduce_scatter_handlers = {}
 
         self.memory_pools = [
@@ -850,6 +850,14 @@ class ISPCommunicatorWrapper:
             self.enable_memory_pool = True
         else:
             self.enable_memory_pool = False
+
+    def set_communicator(self, index, communicator):
+        assert index < len(CommunicatorType)
+        self.isp_communicators[index] = communicator
+
+    def get_communicator(self, index):
+        assert index < len(CommunicatorType)
+        return self.isp_communicators[index]
 
     def free_reduce_scatter_memory(self, key, index):
         for memory_pool in self.memory_pools:
