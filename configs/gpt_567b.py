@@ -102,6 +102,7 @@ hybrid_zero_optimizer = dict(
     clip_grad_norm=1.0,
 )
 
+use_precise_moe_loss = False
 loss = dict(
     label_smoothing=0,
     moe_loss_coeff=0.1,
@@ -206,7 +207,7 @@ parallel = dict(
     tensor=dict(size=16, mode="mtp"),
     pipeline=dict(size=16, interleaved_overlap=True),
     weight=dict(size=1, overlap=True, memory_pool=True),
-    expert=dict(size=16, no_tp=False),
+    expert=dict(size=16, no_tp=True),
     expert_weight=dict(size=1, overlap=True, memory_pool=True),
 )
 

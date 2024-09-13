@@ -151,6 +151,7 @@ def top1gating(
     noisy_gate_policy: Optional[str] = None,
     drop_tokens: bool = True,
     use_rts: bool = True,
+    use_precise_moe_loss: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top1Gating on logits."""
     if noisy_gate_policy == "RSample":
@@ -182,7 +183,12 @@ def top1gating(
     # Compute l_aux
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.type_as(logits), dim=0)
-    l_aux = torch.sum(me * ce) * num_experts
+    if use_precise_moe_loss and gpc.config.parallel.sequence_parallel:
+        world_size = gpc.get_world_size(ParallelMode.TENSOR)
+        torch.distributed.all_reduce(ce, group=gpc.get_group(ParallelMode.TENSOR))
+        l_aux = torch.sum(me * ce) * num_experts / (world_size * world_size)
+    else:
+        l_aux = torch.sum(me * ce) * num_experts
 
     # Random Token Selection
     if use_rts:
@@ -226,7 +232,12 @@ def top1gating(
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
-def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+def top2gating(
+    logits: Tensor,
+    capacity_factor: float,
+    min_capacity: int,
+    use_precise_moe_loss: bool = False,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements Top2Gating on logits."""
     # everything is in fp32 in this function
     gates = F.softmax(logits, dim=1)
@@ -258,7 +269,12 @@ def top2gating(logits: Tensor, capacity_factor: float, min_capacity: int) -> Tup
     # Compute l_aux
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.type_as(logits), dim=0)
-    l_aux = torch.mean(me * ce) * num_experts * num_experts
+    if use_precise_moe_loss and gpc.config.parallel.sequence_parallel:
+        world_size = gpc.get_world_size(ParallelMode.TENSOR)
+        torch.distributed.all_reduce(ce, group=gpc.get_group(ParallelMode.TENSOR))
+        l_aux = torch.sum(me * ce) * num_experts / (world_size * world_size)
+    else:
+        l_aux = torch.sum(me * ce) * num_experts
 
     # Remove locations outside capacity from mask
     mask1 *= torch.lt(locations1, capacity)
@@ -297,6 +313,7 @@ def fused_topkgating(
     k: int,
     capacity_factor: float,
     min_capacity: int,
+    use_precise_moe_loss: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Implements TopKGating on logits."""
     # everything is in fp32 in this function
@@ -323,8 +340,14 @@ def fused_topkgating(
     # Compute l_aux
     me = torch.mean(gates, dim=0)
     ce = torch.mean(masks[0].type_as(logits), dim=0)
-    l_aux = torch.mean(me * ce) * num_experts * num_experts
-
+    # We can keep me local since we don't need the gradient for ce,
+    # saving one allreduce operation for me.
+    if use_precise_moe_loss and gpc.config.parallel.sequence_parallel:
+        world_size = gpc.get_world_size(ParallelMode.TENSOR)
+        torch.distributed.all_reduce(ce, group=gpc.get_group(ParallelMode.TENSOR))
+        l_aux = torch.sum(me * ce) * num_experts / (world_size * world_size)
+    else:
+        l_aux = torch.sum(me * ce) * num_experts
     # Remove locations outside capacity from mask
     masks *= torch.lt(locations, capacity)
 
@@ -394,6 +417,8 @@ class TopKGate(Module):
         self.use_rts = use_rts
         self.use_fused_gating = use_fused_gating
 
+        self.use_precise_moe_loss = getattr(gpc.config, "use_precise_moe_loss", False)
+
     def forward(
         self, inputs: torch.Tensor, used_token: torch.Tensor = None
     ) -> Tuple[Tensor, Tensor, Tensor]:  # type: ignore
@@ -408,7 +433,11 @@ class TopKGate(Module):
         if self.use_fused_gating or self.k > 2:
             assert self.noisy_gate_policy != "RSample", "RSample noisy is not supported by fused_gating policy"
             gate_output = fused_topkgating(
-                logits, self.k, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
+                logits,
+                self.k,
+                self.capacity_factor if self.training else self.eval_capacity_factor,
+                self.min_capacity,
+                self.use_precise_moe_loss,
             )
         # deepspeed-style code
         elif self.k == 1:
@@ -420,11 +449,15 @@ class TopKGate(Module):
                 self.noisy_gate_policy if self.training else None,
                 self.drop_tokens,
                 self.use_rts,
+                self.use_precise_moe_loss,
             )
 
         elif self.k == 2:
             gate_output = top2gating(
-                logits, self.capacity_factor if self.training else self.eval_capacity_factor, self.min_capacity
+                logits,
+                self.capacity_factor if self.training else self.eval_capacity_factor,
+                self.min_capacity,
+                self.use_precise_moe_loss,
             )
         else:
             assert False, "Unsupported gating policy"

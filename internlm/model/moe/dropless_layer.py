@@ -809,11 +809,20 @@ class DroplessMoELayer(BaseMoELayer):
 
     def load_balancing_loss(self, num_local_tokens_per_expert, gates):
         """Calculate the load balancing loss contribution."""
+        num_tokens = gates.shape[0]
+        num_experts = gates.shape[1]
         assert len(gates.size()) == 2
-        tokens, num_experts = gates.size()
         assert num_experts == self.num_experts
         assert len(num_local_tokens_per_expert.size()) == 1
-        (num_experts,) = num_local_tokens_per_expert.size()
         assert num_experts == self.num_experts
-        scale = self.num_experts / (tokens * self.topk)
+
+        # We can keep gates local since we don't need the gradient for num_local_tokens_per_expert,
+        # saving one allreduce operation for gates.
+        world_size = 1
+        if self.use_precise_moe_loss and gpc.config.parallel.sequence_parallel:
+            world_size = gpc.get_world_size(ParallelMode.TENSOR)
+            num_tokens = num_experts * world_size
+            torch.distributed.all_reduce(num_local_tokens_per_expert, group=gpc.get_group(ParallelMode.TENSOR))
+
+        scale = self.num_experts / (num_tokens * self.top_k * world_size)
         return scale * torch.dot(num_local_tokens_per_expert.to(gates.dtype), gates.mean(dim=0))

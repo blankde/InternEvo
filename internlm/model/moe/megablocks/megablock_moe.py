@@ -275,13 +275,20 @@ class MegaBlockMoE(BaseMoELayer):
 
     def load_balancing_loss(self, tokens_per_expert, expert_scores):
         """Calculate the load balancing loss contribution."""
+        tokens = expert_scores.shape[0]
+        num_experts = expert_scores.shape[1]
+
+        world_size = 1
+        if self.use_precise_moe_loss and gpc.config.parallel.sequence_parallel:
+            world_size = gpc.get_world_size(ParallelMode.TENSOR)
+            tokens = tokens * world_size
+            torch.distributed.all_reduce(tokens_per_expert, group=gpc.get_group(ParallelMode.TENSOR))
         assert len(expert_scores.size()) == 2
-        tokens, num_experts = expert_scores.size()
         assert num_experts == self.num_experts
         assert len(tokens_per_expert.size()) == 1
         (num_experts,) = tokens_per_expert.size()
         assert num_experts == self.num_experts
-        scale = self.num_experts / (tokens * self.top_k)
+        scale = self.num_experts / (tokens * self.top_k * world_size)
         return scale * torch.dot(tokens_per_expert.to(expert_scores.dtype), expert_scores.mean(dim=0))
 
     def forward(self, *inputs) -> torch.Tensor:

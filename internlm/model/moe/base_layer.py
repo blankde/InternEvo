@@ -34,6 +34,7 @@ class BaseMoELayer(Base):
         self.num_local_experts = num_local_experts
         self.l_aux = torch.tensor(0.0, device=get_current_device(), dtype=gpc.config.model.get("dtype"))
         self.exp_counts = None
+        self.use_precise_moe_loss = getattr(gpc.config, "use_precise_moe_loss", False)
 
         for _, param in self.gate.named_parameters():
             param.is_gate = True
