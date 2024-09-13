@@ -303,6 +303,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
             gpc.config.parallel.weight.overlap,
             gpc.config.parallel.weight.memory_pool,
             gpc.get_group(ParallelMode.WEIGHT),
+            is_moe=False,
         )
         # register communicator for isp column parallel linear.
         ColumnParallelLinear.register_cls_communicator(isp_communicator)
@@ -328,6 +329,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
                 gpc.config.parallel.expert_weight.overlap,
                 gpc.config.parallel.expert_weight.memory_pool,
                 gpc.get_group(ParallelMode.EXPERT_WEIGHT),
+                is_moe=True,
             )
             for moe in _submodule_filter(model, Experts):
                 for column_linear in _submodule_filter(moe, (ColumnParallelLinear)):
