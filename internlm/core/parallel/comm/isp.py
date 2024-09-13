@@ -835,25 +835,19 @@ class ISPCommunicatorWrapper:
         self,
     ) -> None:
         self.isp_communicators = [None for _ in range(len(CommunicatorType))]
-        self.reduce_scatter_handlers = {}
+        self.memory_pools = [None for _ in range(len(CommunicatorType))]
 
-        self.memory_pools = [
-            isp_communicator.memory_pool
-            for isp_communicator in self.isp_communicators
-            if isp_communicator.enable_memory_pool
-        ]
-        self.reduce_scatter_handlers = UniqueChainMap(
-            *(isp_communicator.reduce_scatter_handlers for isp_communicator in self.isp_communicators)
-        )
+        self.reduce_scatter_handlers = UniqueChainMap()
 
-        if self.memory_pools:
-            self.enable_memory_pool = True
-        else:
-            self.enable_memory_pool = False
+        self.enable_memory_pool = False
 
     def set_communicator(self, index, communicator):
         assert index < len(CommunicatorType)
         self.isp_communicators[index] = communicator
+        self.reduce_scatter_handlers = self.reduce_scatter_handlers.new_child(communicator.reduce_scatter_handlers)
+        if communicator.enable_memory_pool:
+            self.memory_pools[index] = communicator.memory_pool
+            self.enable_memory_pool = True
 
     def get_communicator(self, index):
         assert index < len(CommunicatorType)
@@ -861,12 +855,13 @@ class ISPCommunicatorWrapper:
 
     def free_reduce_scatter_memory(self, key, index):
         for memory_pool in self.memory_pools:
-            if key in memory_pool._reduce_scatter_memory_pool:
+            if memory_pool is not None and key in memory_pool._reduce_scatter_memory_pool:
                 memory_pool.free_reduce_scatter_memory(key, index)
 
     def reset_lazy_pools(self) -> None:
         for memory_pool in self.memory_pools:
-            memory_pool.reset_lazy_pools()
+            if memory_pool is not None:
+                memory_pool.reset_lazy_pools()
 
     def register_prerequisite_for_forward_prefetch_hooks(self, prerequisite_func: Callable) -> None:
         for isp_communicator in self.isp_communicators:
