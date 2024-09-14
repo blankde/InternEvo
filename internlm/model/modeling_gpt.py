@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from internlm.core.context import IS_REPLICA_ZERO_PARALLEL, ParallelMode
+from internlm.core.context import ParallelMode
 from internlm.core.context.parallel_context import global_context as gpc
 from internlm.initialize.initialize_tensor import normal_, scaled_init_method_normal
 from internlm.model.base_model import BaseModel
@@ -384,8 +384,8 @@ class GPTMoE(BaseModel):
                 num_embeddings=max_position_embeddings, embedding_dim=hidden_size, vocab_parallel=True, device=device
             )
 
-            for param in self.position_embeddings.parameters():
-                setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
+            # for param in self.position_embeddings.parameters():
+            #     setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
             for _, param in self.embedding.named_parameters():
                 normal_(std=0.0052)(param)

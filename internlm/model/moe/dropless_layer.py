@@ -824,5 +824,5 @@ class DroplessMoELayer(BaseMoELayer):
             num_tokens = num_experts * world_size
             torch.distributed.all_reduce(num_local_tokens_per_expert, group=gpc.get_group(ParallelMode.TENSOR))
 
-        scale = self.num_experts / (num_tokens * self.top_k * world_size)
+        scale = self.num_experts / (num_tokens * self.topk * world_size)
         return scale * torch.dot(num_local_tokens_per_expert.to(gates.dtype), gates.mean(dim=0))
