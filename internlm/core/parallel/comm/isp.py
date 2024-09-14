@@ -179,7 +179,6 @@ class EmbeddingWeightParallelCommunicator:
         self.parallel_mode = parallel_mode
         self.gather_dim = 0
 
-        self._cur_micro_step = 0
         self._num_micro_step = gpc.config.data.micro_num
 
     def register_module_hook(self, module: Embedding1D) -> None:
@@ -233,6 +232,7 @@ class EmbeddingWeightParallelCommunicator:
         module.register_forward_pre_hook(_pre_forward_hook)
         module.register_forward_hook(_post_forward_hook)
 
+        setattr(module.weight, "_cur_micro_step", 0)
         module.weight.register_post_accumulate_grad_hook(self.grad_reduce_hook)
 
     def grad_reduce_hook(self, param: torch.Tensor):
@@ -248,11 +248,11 @@ class EmbeddingWeightParallelCommunicator:
         param.data = param.evo_tensor
         param.grad = None
 
-        self._cur_micro_step += 1
-        if self._cur_micro_step == self._num_micro_step:
+        param._cur_micro_step += 1
+        if param._cur_micro_step == self._num_micro_step:
             param.grad = param.evo_tensor.grad
             param.evo_tensor.grad = None
-            self._cur_micro_step = 0
+            param._cur_micro_step = 0
 
 
 class ISPCommModelConfig:
