@@ -18,7 +18,12 @@ from internlm.core.parallel.shard import (
     get_parallel_strategies_split_mode,
     get_tensor_split_parallel_mode,
 )
-from internlm.model.ops.linear import linear_backward_op, linear_forward_op
+from internlm.model.ops.linear import (
+    gmm_backward_op,
+    gmm_forward_op,
+    linear_backward_op,
+    linear_forward_op,
+)
 from internlm.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -290,6 +295,191 @@ class WPFusedDenseFunc(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
+class GroupedGemmSPFusedDenseFunc(torch.autograd.Function):
+    "Grouped Gemm FusedDenseFunc for tensor parallel"
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        batch_sizes: torch.Tensor,
+        backend: str,
+    ):
+
+        if backend == "bmm":
+            assert x.dim() == 3, f"bmm only support 3d input (e, c, m), but got: {x.shape}"
+        elif backend == "gmm":
+            assert x.dim() == 2, f"gmm only support 2d input (s, m), but got: {x.shape}"
+            assert batch_sizes is not None, "batch_sizes should be provided for gmm"
+        else:
+            raise NotImplementedError(f"Invalid backend: {backend}")
+
+        input_numel = x.numel()
+        if input_numel == 0:
+            backend = "bmm"
+
+        ctx.compute_weight_gradient = weight.requires_grad
+        ctx.backend = backend
+
+        if torch.is_autocast_enabled():
+            x = x.to(dtype=torch.get_autocast_gpu_dtype())
+        x = x.contiguous()
+
+        if backend == "gmm":
+            output = gmm_forward_op(x, weight, batch_sizes)
+        else:
+            if input_numel == 0:
+                # if inp is empty, reshape to make grad flow.
+                # inp shape: (0, hdim)
+                weight = weight.view(x.shape[-1], -1)
+
+            output = torch.matmul(x, weight)
+
+        saved_x = None if ctx.compute_weight_gradient is False else x
+        ctx.save_for_backward(saved_x, weight, batch_sizes)
+
+        return output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        backend = ctx.backend
+
+        grad_output = grad_output.contiguous()
+        x, weight, batch_sizes = ctx.saved_tensors
+        grad_input, grad_weight = None, None
+
+        if ctx.needs_input_grad[1]:
+            assert ctx.compute_weight_gradient
+            if backend == "gmm":
+                grad_input, grad_weight = gmm_backward_op(x, grad_output, batch_sizes, input_weight=weight)
+            else:
+                grad_weight = torch.matmul(x.transpose(-1, -2), grad_output)
+
+        if ctx.needs_input_grad[0]:
+            if backend == "gmm":
+                if grad_input is None:
+                    grad_input, _ = gmm_backward_op(grad_output, weight, batch_sizes, is_grad_input=True)
+            else:
+                grad_input = torch.matmul(grad_output, weight.transpose(-1, -2))
+
+        return grad_input, grad_weight, None, None, None, None, None
+
+
+class GroupedGemmWPFusedDenseFunc(torch.autograd.Function):
+    "Grouped Gemm FusedDenseFunc for weigth parallel."
+
+    @staticmethod
+    @custom_fwd
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        module: nn.Module,
+        communicator: WPCommunicator,
+        batch_sizes: torch.Tensor,
+        backend: str,
+        full_weight_shape: torch.Size,
+    ):
+        assert full_weight_shape is not None, "full_weight_shape should be provided"
+        if backend == "bmm":
+            assert x.dim() == 3, f"bmm only support 3d input (e, c, m), but got: {x.shape}"
+        elif backend == "gmm":
+            assert x.dim() == 2, f"gmm only support 2d input (s, m), but got: {x.shape}"
+            assert batch_sizes is not None, "batch_sizes should be provided for gmm"
+        else:
+            raise NotImplementedError(f"Invalid backend: {backend}")
+
+        input_numel = x.numel()
+        if input_numel == 0:
+            backend = "bmm"
+
+        ctx.compute_weight_gradient = weight.requires_grad
+        ctx.module = module
+        ctx.communicator = communicator
+        ctx.backend = backend
+        ctx.full_weight_shape = full_weight_shape
+
+        if torch.is_autocast_enabled():
+            x = x.to(dtype=torch.get_autocast_gpu_dtype())
+        x = x.contiguous()
+
+        total_weight = communicator.weight_hook(weight, module=module)
+        total_weight = total_weight.reshape(full_weight_shape)
+
+        if torch.is_autocast_enabled():
+            total_weight = total_weight.to(dtype=torch.get_autocast_gpu_dtype())
+        total_weight = total_weight.contiguous()
+
+        if backend == "gmm":
+            output = gmm_forward_op(x, total_weight, batch_sizes)
+        else:
+            if input_numel == 0:
+                # if inp is empty, reshape to make grad flow.
+                # inp shape: (0, hdim)
+                total_weight = total_weight.view(x.shape[-1], -1)
+
+            output = torch.matmul(x, total_weight)
+
+        # release memory
+        del total_weight
+
+        saved_x = None if ctx.compute_weight_gradient is False else x
+        ctx.save_for_backward(saved_x, weight, batch_sizes)
+
+        return output
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_output):
+        module: nn.Module = ctx.module
+        communicator: WPCommunicator = ctx.communicator
+        x, weight, batch_sizes = ctx.saved_tensors
+        backend = ctx.backend
+        full_weight_shape = ctx.full_weight_shape
+
+        grad_output = grad_output.contiguous()
+
+        total_weight = communicator.weight_hook(weight, module=module)
+        total_weight = total_weight.reshape(full_weight_shape)
+        grad_input, grad_weight = None, None
+        if grad_output.numel() == 0:
+            if ctx.needs_input_grad[0]:
+                grad_input = torch.zeros_like(x)
+            if ctx.needs_input_grad[1]:
+                grad_weight = torch.zeros_like(total_weight).reshape(-1, full_weight_shape[-1])
+                grad_weight, _ = communicator.grad_hook(grad_weight, async_op=False, module=module, is_bias=False)
+
+            return grad_input, grad_weight, None, None, None, None, None
+
+        if ctx.needs_input_grad[1]:
+            assert ctx.compute_weight_gradient
+            if backend == "gmm":
+                grad_input, grad_weight = gmm_backward_op(x, grad_output, batch_sizes, input_weight=total_weight)
+            else:
+                grad_weight = torch.matmul(x.transpose(-1, -2), grad_output)
+            grad_weight = grad_weight.view(-1, grad_weight.shape[-1])
+            grad_weight, grad_weight_sync = communicator.grad_hook(
+                grad_weight, async_op=True, module=module, is_bias=False
+            )
+
+        if ctx.needs_input_grad[0]:
+            if backend == "gmm":
+                if grad_input is None:
+                    grad_input, _ = gmm_backward_op(grad_output, total_weight, batch_sizes, is_grad_input=True)
+            else:
+                grad_input = torch.matmul(grad_output, total_weight.transpose(-1, -2))
+
+        del total_weight
+
+        if ctx.needs_input_grad[1]:
+            grad_weight_sync.wait()
+
+        return grad_input, grad_weight, None, None, None, None, None
+
+
 def fused_dense_func(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -297,24 +487,51 @@ def fused_dense_func(
     module: Optional[nn.Module] = None,
     bias: Optional[torch.Tensor] = None,
     return_residual: bool = False,
+    use_grouped_linear: bool = False,
+    **kwargs,
 ):
     if communicator.communication_mode() == "wp":
-        return WPFusedDenseFunc.apply(
-            x,
-            weight,
-            bias,
-            module,
-            communicator,
-            return_residual,
-        )
+        if not use_grouped_linear:
+            return WPFusedDenseFunc.apply(
+                x,
+                weight,
+                bias,
+                module,
+                communicator,
+                return_residual,
+            )
+        else:
+            batch_sizes = kwargs.pop("batch_sizes", None)
+            backend = kwargs.pop("backend", "gmm")
+            full_weight_shape = kwargs.pop("full_weight_shape", None)
+            return GroupedGemmWPFusedDenseFunc.apply(
+                x,
+                weight,
+                module,
+                communicator,
+                batch_sizes,
+                backend,
+                full_weight_shape,
+            )
     else:  # mtp, msp, and fsp
-        return SPFusedDenseFunc.apply(
-            x,
-            weight,
-            bias,
-            communicator,
-            return_residual,
-        )
+        if not use_grouped_linear:
+            return SPFusedDenseFunc.apply(
+                x,
+                weight,
+                bias,
+                communicator,
+                return_residual,
+            )
+        else:
+            # TODO: support grouped linear for mtp, msp, and fsp
+            batch_sizes = kwargs.pop("batch_sizes", None)
+            backend = kwargs.pop("backend", "gmm")
+            return GroupedGemmSPFusedDenseFunc.apply(
+                x,
+                weight,
+                batch_sizes,
+                backend,
+            )
 
 
 class ParallelLinearWithCommExt(nn.Linear):
@@ -376,9 +593,18 @@ class ParallelLinearWithCommExt(nn.Linear):
         else:
             super().__init__(in_features, out_features, bias=bias, device=device, dtype=dtype)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=W0622
+    def forward(self, input: torch.Tensor, batch_sizes: torch.Tensor = None) -> torch.Tensor:  # pylint: disable=W0622
         _class_name = self.__class__.__name__
         assert self._communicator is not None, f"{_class_name} should register with a communicator first."
+
+        mixer_kwargs = {}
+        use_grouped_linear = getattr(self, "is_grouped_linear", False)
+        if use_grouped_linear:
+            mixer_kwargs = {
+                "batch_sizes": batch_sizes,
+                "backend": self.backend,
+                "full_weight_shape": self.full_weight_shape if hasattr(self, "full_weight_shape") else None,
+            }
 
         return fused_dense_func(
             input,
@@ -386,6 +612,8 @@ class ParallelLinearWithCommExt(nn.Linear):
             communicator=self._communicator,
             module=self,
             bias=self.bias,
+            use_grouped_linear=use_grouped_linear,
+            **mixer_kwargs,
         )
 
 
@@ -567,6 +795,119 @@ class RewardModelLinear(ScaleColumnParallelLinear):
             dist.broadcast(self.bias, gpc.get_ranks_in_group(parallel_mode)[0], process_group)
 
 
+class GroupedColumnLinear(ParallelLinearWithCommExt):
+    """
+    GroupedSPLinear
+    Args:
+        in_features (int): size of each input sample
+        out_features (int): size of each output sample
+        num_groups (int): number of groups.
+        backend (str): backend used for the grouped linear. It can be "gmm" or "bmm".
+        device (Optional[Union[str, torch.device]]): The device will be used.
+        dtype (Optional[torch.dtype]): The type of data.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_groups: int,
+        backend: str = "gmm",
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+        is_expert: bool = True,
+    ):
+        self.is_grouped_linear = True
+        parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
+        world_size = gpc.get_world_size(parallel_mode)
+        assert world_size == 1, "GroupedSPLinear not support tensor parallel yet."
+
+        self.backend = backend
+        super().__init__(
+            in_features, out_features, parallel_mode, bias=False, device=device, dtype=dtype, split_mode="none"
+        )
+
+        self.weight = nn.Parameter(torch.empty(num_groups, in_features, out_features, device=device, dtype=dtype))
+
+
+class GroupedRowLinear(ParallelLinearWithCommExt):
+    """
+    GroupedSPLinear
+    Args:
+        in_features (int): size of each input sample
+        out_features (int): size of each output sample
+        num_groups (int): number of groups.
+        backend (str): backend used for the grouped linear. It can be "gmm" or "bmm".
+        device (Optional[Union[str, torch.device]]): The device will be used.
+        dtype (Optional[torch.dtype]): The type of data.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_groups: int,
+        backend: str = "gmm",
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+        is_expert: bool = True,
+    ):
+        self.is_grouped_linear = True
+        parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
+        world_size = gpc.get_world_size(parallel_mode)
+        assert world_size == 1, "GroupedSPLinear not support tensor parallel yet."
+
+        self.backend = backend
+        # TODO avoid init for base class
+        super().__init__(
+            in_features, out_features, parallel_mode, bias=False, device=device, dtype=dtype, split_mode="none"
+        )
+
+        self.weight = nn.Parameter(torch.empty(num_groups, in_features, out_features, device=device, dtype=dtype))
+
+
+class GroupedWPLinear(ParallelLinearWithCommExt):
+    """
+    GroupedWPLinear
+    Args:
+        in_features (int): size of each input sample
+        out_features (int): size of each output sample
+        num_groups (int): number of groups.
+        backend (str): backend used for the grouped linear. It can be "gmm" or "bmm".
+        device (Optional[Union[str, torch.device]]): The device will be used.
+        dtype (Optional[torch.dtype]): The type of data.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_groups: int,
+        backend: str = "gmm",
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+        is_expert: bool = True,
+    ):
+        self.is_grouped_linear = True
+        parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
+        world_size = gpc.get_world_size(parallel_mode)
+
+        self.backend = backend
+        self.full_weight_shape = torch.Size((num_groups, in_features, out_features))
+
+        merged_in_features = in_features * num_groups // world_size
+
+        super().__init__(
+            out_features,
+            merged_in_features,
+            parallel_mode,
+            bias=False,
+            device=device,
+            dtype=dtype,
+            split_mode="none",
+        )
+
+
 def new_linear(
     name: str,
     in_features: int,
@@ -631,6 +972,36 @@ def new_linear(
             out_features,
             bias,
             multiple_of,
+            device,
+            dtype,
+            is_expert,
+        )
+    elif split_mode == "grouped_wp":
+        return GroupedWPLinear(
+            in_features,
+            out_features,
+            kwargs["num_groups"],
+            kwargs["backend"],
+            device,
+            dtype,
+            is_expert,
+        )
+    elif split_mode == "grouped_column":
+        return GroupedColumnLinear(
+            in_features,
+            out_features,
+            kwargs["num_groups"],
+            kwargs["backend"],
+            device,
+            dtype,
+            is_expert,
+        )
+    elif split_mode == "grouped_row":
+        return GroupedRowLinear(
+            in_features,
+            out_features,
+            kwargs["num_groups"],
+            kwargs["backend"],
             device,
             dtype,
             is_expert,

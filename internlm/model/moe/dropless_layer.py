@@ -149,9 +149,9 @@ class DroplessMoELayer(BaseMoELayer):
         drop_policy="probs",
         capacity_factor: float = None,
         noisy_gate_policy: str = None,
-        moe_grouped_mlp: bool = True,
         enable_fused_permute: bool = True,
         token_dispatch_policy: str = "alltoall",
+        use_grouped_mlp: bool = True,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
             "Unsupported noisy_gate_policy: " + noisy_gate_policy
@@ -160,8 +160,23 @@ class DroplessMoELayer(BaseMoELayer):
             num_experts % ep_size == 0
         ), f"Number of experts ({num_experts}) should be divisible by expert parallel size ({ep_size})"
 
-        if moe_grouped_mlp:
-            assert False, "not support yet"
+        backend = "bmm" if drop_and_pad else "gmm"
+        if use_grouped_mlp:
+            experts = new_feed_forward(
+                in_features,
+                hidden_features,
+                out_features,
+                bias=False,
+                device=device,
+                dtype=dtype,
+                mlp_layer_fusion=mlp_layer_fusion,
+                multiple_of=multiple_of,
+                activation_type=activation_type,
+                is_expert=True,
+                use_grouped_mlp=True,
+                num_groups=num_experts // ep_size,
+                backend=backend,
+            )
         else:
             experts = torch.nn.ModuleList(
                 [
@@ -198,7 +213,7 @@ class DroplessMoELayer(BaseMoELayer):
         self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
         self.topk = top_k
-        self.moe_grouped_mlp = moe_grouped_mlp
+        self.use_grouped_mlp = use_grouped_mlp
 
         self.drop_and_pad = drop_and_pad
         self.capacity_factor = capacity_factor
@@ -259,7 +274,7 @@ class DroplessMoELayer(BaseMoELayer):
         expert_weights, indices = self.topk_softmax_with_capacity(self.gates)
 
         (dispatched_input, tokens_per_expert) = self.token_permutation_func(reshaped_inputs, expert_weights, indices)
-        if self.moe_grouped_mlp:
+        if self.use_grouped_mlp:
             expert_output = self.experts(dispatched_input, batch_sizes=tokens_per_expert)
         else:
             expert_output = self.experts(dispatched_input, split_size_or_sections=tokens_per_expert, split_dim=0)
@@ -403,7 +418,7 @@ class DroplessMoELayer(BaseMoELayer):
             num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(self.num_experts)
             num_tokens_per_local_expert = num_local_tokens_per_expert
 
-        if self.moe_grouped_mlp:
+        if self.use_grouped_mlp:
             num_tokens_per_local_expert = num_tokens_per_local_expert.to(torch.device("cpu"), non_blocking=True)
 
         if self.num_local_experts > 1 and self.ep_size > 1:
@@ -744,7 +759,7 @@ class DroplessMoELayer(BaseMoELayer):
             tokens_per_expert = torch.histc(local_indices.view(-1), bins=self.num_experts, min=0, max=self.num_experts)
             if self.num_local_experts < self.num_experts:
                 tokens_per_expert = tokens_per_expert[self.local_expert_indices[0] : self.local_expert_indices[-1] + 1]
-            if self.moe_grouped_mlp:
+            if self.use_grouped_mlp:
                 tokens_per_expert = tokens_per_expert.cpu().to(torch.long)
 
         # Stage2: permute the tokens locally so that they are grouped by their expert assignment

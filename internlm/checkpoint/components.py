@@ -10,7 +10,13 @@ from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.core.trainer import TrainState
-from internlm.model.moe.moe import MoE
+from internlm.model.moe import (
+    DroplessMoELayer,
+    GShardMoELayer,
+    MegaBlockdMoE,
+    MegaBlockMoE,
+    MoE,
+)
 from internlm.solver.optimizer import HybridZeroOptimizer, HybridZeroOptimizer_v2
 from internlm.utils.common import get_current_device
 from internlm.utils.logger import get_logger
@@ -29,25 +35,128 @@ internlm_accelerator = get_accelerator()
 
 
 def try_load_moe_checkpoint(folder, model, state_dict, tp_rank, pp_rank):
-    pipeline_stage_size = gpc.config.model.num_layers // gpc.get_world_size(ParallelMode.PIPELINE)
-    moe_layer_id = pp_rank * pipeline_stage_size
-    for _, module in model.named_modules():
+    """Load MoE layer parameters from separate files if the model has MoE layers."""
+
+    # Calculate the stage size and rank within the pipeline parallelism
+    pp_stage_size = gpc.config.model.num_layers // gpc.get_world_size(ParallelMode.PIPELINE)
+    moe_layer_id = pp_rank * pp_stage_size
+
+    # Initialize variables to store checkpoint dimensions and local grouped experts count
+    ckpt_shape = None
+
+    gate_type = ""
+
+    # Iterate over all modules in the model to find MoE layers
+    for name, module in model.named_modules():
         if isinstance(module, MoE):
-            num_local_experts = module.moe_layer.num_local_experts
+            # Get the number of local experts and the dimensionality of the expert weights
+            num_local_wrapped_experts = len(module.moe_layer.experts.wrapped_experts)
+            num_local_experts = gpc.config.model.num_experts // gpc.get_world_size(ParallelMode.EXPERT)
+
+            if isinstance(module.moe_layer, (DroplessMoELayer, GShardMoELayer)):
+                moe_weight_shape = module.moe_layer.experts.wrapped_experts[0].w1.weight.shape
+                weight_key_suffix = ".weight"
+                gate_type = "gshard"
+            elif isinstance(module.moe_layer, (MegaBlockdMoE, MegaBlockMoE)):
+                moe_weight_shape = module.moe_layer.experts.wrapped_experts[0].w1.shape
+                weight_key_suffix = ""
+                gate_type = "megablock"
+
             expp_rank = gpc.get_local_rank(ParallelMode.EXPERT)
-            # loop all local_experts
-            for local_expert_id in range(num_local_experts):
-                global_expert_id = expp_rank * num_local_experts + local_expert_id
-                fn = f"model_moe_layer{moe_layer_id}_expert{global_expert_id}_tp{tp_rank}.pt"
+
+            # Determine the mode (either weight parallel or tensor parallel) and the expert model parallel rank
+            if is_using_isp():
+                expert_mp_rank = gpc.get_local_rank(ParallelMode.EXPERT_WEIGHT)
+                mode = "wp"
+            else:
+                expert_mp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
+                mode = "tp"
+
+            # Load checkpoint dimensions if not already loaded
+            if not ckpt_shape:
+                fn = f"model_moe_layer{moe_layer_id}_expert0_{mode}{expert_mp_rank}.pt"
                 fp = os.path.join(folder, fn)
-                expert_state_dict = llm_load(fp, map_location=get_current_device())
-                # Updating global -> local expert ids
-                moe_str_prefix = ".moe_layer.experts.wrapped_experts."
-                for key in list(expert_state_dict.keys()):
-                    local_key = key.replace(f"{moe_str_prefix}{global_expert_id}", f"{moe_str_prefix}{local_expert_id}")
-                    expert_state_dict[local_key] = expert_state_dict.pop(key)
+                expert_state_dict_load = llm_load(fp, map_location=get_current_device())
+                ckpt_shape = next(iter(expert_state_dict_load.values())).shape
+
+            for local_expert_id in range(num_local_wrapped_experts):
+                expert_state_dict = defaultdict(dict)
+                moe_str_prefix = f"{name}.moe_layer.experts.wrapped_experts."
+
+                if ckpt_shape == moe_weight_shape:  # auto_resume, GShardMoELayer
+                    global_expert_id = expp_rank * num_local_wrapped_experts + local_expert_id
+                    fn = f"model_moe_layer{moe_layer_id}_expert{global_expert_id}_{mode}{expert_mp_rank}.pt"
+                    fp = os.path.join(folder, fn)
+                    try:
+                        cur_expert_state_dict = llm_load(fp, map_location=get_current_device())
+                    except AssertionError:
+                        # compatible with old codes
+                        global_expert_id = expp_rank * num_local_experts + local_expert_id
+                        fn = f"model_moe_layer{moe_layer_id}_expert{global_expert_id}_{mode}{expert_mp_rank}.pt"
+                        fp = os.path.join(folder, fn)
+                        cur_expert_state_dict = llm_load(fp, map_location=get_current_device())
+                    for key in cur_expert_state_dict.keys():
+                        local_key = key.replace(
+                            f"{moe_str_prefix}{global_expert_id}", f"{moe_str_prefix}{local_expert_id}"
+                        )
+                        expert_state_dict[local_key] = cur_expert_state_dict[key]
+                elif (isinstance(module.moe_layer, (DroplessMoELayer, GShardMoELayer)) and mode == "wp") or (
+                    isinstance(module.moe_layer, MegaBlockdMoE)
+                ):  # merged dim0
+                    expert_w_state = {"w1": [], "w2": [], "w3": []}
+                    local_expert_ids = range(num_local_experts * expp_rank, num_local_experts * (expp_rank + 1))
+                    for i in local_expert_ids:
+                        fn = f"model_moe_layer{moe_layer_id}_expert{i}_{mode}{expert_mp_rank}.pt"
+                        fp = os.path.join(folder, fn)
+                        cur_expert_state_dict = llm_load(fp, map_location=get_current_device())
+                        pattern = r"\.(w\d)\.weight|\.(w\d)$"
+                        for key, weight in cur_expert_state_dict.items():
+                            # key: moe_layer.experts.wrapped_experts.i.w_i.weight
+                            w_i = re.search(pattern, key).group(1) or re.search(pattern, key).group(2)
+                            if isinstance(module.moe_layer, (DroplessMoELayer, GShardMoELayer)) or w_i == "w2":
+                                expert_w_state[w_i].append(weight.T)
+                            else:
+                                expert_w_state[w_i].append(weight)
+                    for weight_key, weights in expert_w_state.items():
+                        expert_state_dict[
+                            f"{moe_str_prefix}{local_expert_id}.{weight_key}{weight_key_suffix}"
+                        ] = torch.cat(weights, dim=0)
+                elif isinstance(module.moe_layer, (DroplessMoELayer, GShardMoELayer, MegaBlockMoE)):  # (E//ep, h, i)
+                    local_expert_ids = range(num_local_experts * expp_rank, num_local_experts * (expp_rank + 1))
+                    expert_w_state = {"w1": [], "w2": [], "w3": []}
+                    for i in local_expert_ids:
+                        fn = f"model_moe_layer{moe_layer_id}_expert{i}_{mode}{expert_mp_rank}.pt"
+                        fp = os.path.join(folder, fn)
+                        cur_expert_state_dict = llm_load(fp, map_location=get_current_device())
+                        pattern = r"\.(w\d)\.weight|\.(w\d)$"
+                        for key, weight in cur_expert_state_dict.items():
+                            w_i = re.search(pattern, key).group(1) or re.search(pattern, key).group(2)
+                            expert_w_state[w_i].append(weight.T)
+
+                    for weight_key, weights in expert_w_state.items():
+                        expert_state_dict[
+                            f"{moe_str_prefix}{local_expert_id}.{weight_key}{weight_key_suffix}"
+                        ] = torch.stack(weights, dim=0)
+                else:
+                    raise RuntimeError(f"not support moe layer type: {type(module.moe_layer)}")
+                # Update the state_dict with the loaded expert parameters
                 state_dict.update(expert_state_dict)
+
             moe_layer_id += 1
+
+    # gate key
+    # gshard: gate.wg.weight
+    # megablock: gate.weight
+    suffix_map = {"gshard": (".gate.weight", ".gate.wg.weight"), "megablock": (".gate.wg.weight", ".gate.weight")}
+
+    old_suffix, new_suffix = suffix_map.get(gate_type, (None, None))
+
+    new_state_dict = {
+        (key.replace(old_suffix, new_suffix) if old_suffix and key.endswith(old_suffix) else key): value
+        for key, value in state_dict.items()
+    }
+
+    return new_state_dict
 
 
 def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
@@ -56,7 +165,7 @@ def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
     moe_layer_id = pp_rank * pipeline_stage_size
     for n_module, module in model.named_modules():
         if isinstance(module, MoE):
-            num_local_experts = module.moe_layer.num_local_experts
+            num_local_wrapped_experts = len(module.moe_layer.experts.wrapped_experts)
             expp_rank = gpc.get_local_rank(ParallelMode.EXPERT)
 
             # get all moe parameters
@@ -76,7 +185,7 @@ def try_save_moe_checkpoint(folder, model, tp_rank, pp_rank):
                 else:
                     local_expert_id = m.group(1)
 
-                global_expert_id = expp_rank * num_local_experts + int(local_expert_id)
+                global_expert_id = expp_rank * num_local_wrapped_experts + int(local_expert_id)
                 expert_key = key.replace(f"{moe_str_prefix}{local_expert_id}", f"{moe_str_prefix}{global_expert_id}")
 
                 # truncating extra tensor (shared) storage
