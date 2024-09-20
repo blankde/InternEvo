@@ -4,6 +4,7 @@ Linear Modules
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -795,7 +796,72 @@ class RewardModelLinear(ScaleColumnParallelLinear):
             dist.broadcast(self.bias, gpc.get_ranks_in_group(parallel_mode)[0], process_group)
 
 
-class GroupedColumnLinear(ParallelLinearWithCommExt):
+class GroupedParallelLinearWithCommExt(ParallelLinearWithCommExt):
+    """
+    Parallel linear with commuication extention.
+
+    Args:
+        in_features (int): size of each input sample
+        out_features (int): size of each output sample
+        bias (bool): Whether the bias is needed for linears. True by default. But it is typically set to False
+                    in the config.
+        device (Optional[Union[str, torch.device]]): The device will be used.
+        dtype (Optional[torch.dtype]): The type of data.
+        split_mode (str): The split mode. It can be "none", "column", or "row".
+    """
+
+    def __init__(  # pylint: disable=W0231, W0233
+        self,
+        in_features: int,
+        out_features: int,
+        num_groups: int,
+        parallel_mode: ParallelMode,
+        backend: str = "gmm",
+        multiple_of: int = 1,
+        device: torch.device = None,
+        dtype: torch.dtype = None,
+        split_mode: str = "none",
+    ) -> None:
+        nn.Module.__init__(self)
+
+        assert split_mode in ("none", "column", "row", "weight"), f"unknown split_mode {split_mode}"
+
+        world_size = gpc.get_world_size(parallel_mode)
+        rank = gpc.get_local_rank(parallel_mode)
+
+        split_features_dict = {"column": out_features, "row": in_features, "weight": num_groups * in_features}
+        if split_mode != "none":
+            split_features = split_features_dict[split_mode]
+            multiple = split_features // multiple_of
+            # We want to split @multiple across world_size, but it could be an uneven split
+            div = multiple // world_size
+            mod = multiple % world_size
+            # The first @mod ranks get @div + 1 copies, the rest get @div copies
+            local_multiple = div + int(rank < mod)
+
+        if split_mode == "column":
+            self.weight = nn.Parameter(
+                torch.empty(num_groups, in_features, local_multiple * multiple_of, device=device, dtype=dtype)
+            )
+        elif split_mode == "row":
+            self.weight = nn.Parameter(
+                torch.empty(num_groups, local_multiple * multiple_of, out_features, device=device, dtype=dtype)
+            )
+        elif split_mode == "weight":
+            self.weight = nn.Parameter(
+                torch.empty(local_multiple * multiple_of, out_features, device=device, dtype=dtype)
+            )
+        else:  # none
+            self.weight = nn.Parameter(torch.empty(num_groups, in_features, out_features, device=device, dtype=dtype))
+
+        self.register_parameter("bias", None)
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+        self.is_grouped_linear = True
+        self.backend = backend
+
+
+class GroupedColumnLinear(GroupedParallelLinearWithCommExt):
     """
     GroupedSPLinear
     Args:
@@ -817,20 +883,23 @@ class GroupedColumnLinear(ParallelLinearWithCommExt):
         dtype: torch.dtype = None,
         is_expert: bool = True,
     ):
-        self.is_grouped_linear = True
         parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
+        super().__init__(
+            in_features,
+            out_features,
+            num_groups,
+            parallel_mode,
+            backend,
+            device=device,
+            dtype=dtype,
+            split_mode="column",
+        )
+
         world_size = gpc.get_world_size(parallel_mode)
         assert world_size == 1, "GroupedSPLinear not support tensor parallel yet."
 
-        self.backend = backend
-        super().__init__(
-            in_features, out_features, parallel_mode, bias=False, device=device, dtype=dtype, split_mode="none"
-        )
 
-        self.weight = nn.Parameter(torch.empty(num_groups, in_features, out_features, device=device, dtype=dtype))
-
-
-class GroupedRowLinear(ParallelLinearWithCommExt):
+class GroupedRowLinear(GroupedParallelLinearWithCommExt):
     """
     GroupedSPLinear
     Args:
@@ -852,21 +921,16 @@ class GroupedRowLinear(ParallelLinearWithCommExt):
         dtype: torch.dtype = None,
         is_expert: bool = True,
     ):
-        self.is_grouped_linear = True
         parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
+        super().__init__(
+            in_features, out_features, num_groups, parallel_mode, backend, device=device, dtype=dtype, split_mode="row"
+        )
+
         world_size = gpc.get_world_size(parallel_mode)
         assert world_size == 1, "GroupedSPLinear not support tensor parallel yet."
 
-        self.backend = backend
-        # TODO avoid init for base class
-        super().__init__(
-            in_features, out_features, parallel_mode, bias=False, device=device, dtype=dtype, split_mode="none"
-        )
 
-        self.weight = nn.Parameter(torch.empty(num_groups, in_features, out_features, device=device, dtype=dtype))
-
-
-class GroupedWPLinear(ParallelLinearWithCommExt):
+class GroupedWPLinear(GroupedParallelLinearWithCommExt):
     """
     GroupedWPLinear
     Args:
@@ -888,24 +952,19 @@ class GroupedWPLinear(ParallelLinearWithCommExt):
         dtype: torch.dtype = None,
         is_expert: bool = True,
     ):
-        self.is_grouped_linear = True
         parallel_mode = get_tensor_split_parallel_mode(is_expert=is_expert)
-        world_size = gpc.get_world_size(parallel_mode)
-
-        self.backend = backend
-        self.full_weight_shape = torch.Size((num_groups, in_features, out_features))
-
-        merged_in_features = in_features * num_groups // world_size
-
         super().__init__(
+            in_features,
             out_features,
-            merged_in_features,
+            num_groups,
             parallel_mode,
-            bias=False,
+            backend,
             device=device,
             dtype=dtype,
-            split_mode="none",
+            split_mode="weight",
         )
+
+        self.full_weight_shape = torch.Size((num_groups, in_features, out_features))
 
 
 def new_linear(
