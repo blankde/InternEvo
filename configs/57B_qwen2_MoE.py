@@ -1,12 +1,14 @@
-JOB_NAME = "7b_train"
+JOB_NAME = "57b_qwen2_moe"
+model_type = "QWEN2MOE"
 DO_ALERT = False
 
-SEQ_LEN = 2048
-HIDDEN_SIZE = 4096
-NUM_ATTENTION_HEAD = 32
-MLP_RATIO = 8 / 3
-NUM_LAYER = 32
-VOCAB_SIZE = 103168
+SEQ_LEN = 4096
+HIDDEN_SIZE = 3584
+NUM_ATTENTION_HEAD = 28
+NUM_KV_ATTENTION_HEAD = 4
+MLP_RATIO = 5 / 7
+NUM_LAYER = 28
+VOCAB_SIZE = 151936
 
 MODEL_ONLY_FOLDER = "local:llm_ckpts/xxxx"
 # Ckpt folder format:
@@ -22,7 +24,6 @@ LOAD_CKPT_FOLDER = "local:llm_ckpts/49"
 CHECKPOINT_EVERY = 50
 ckpt = dict(
     enable_save_ckpt=False,  # enable ckpt save.
-    enable_internevo2hf_ckpt=False,  # enable ckpt save for huggingface format.
     save_ckpt_folder=SAVE_CKPT_FOLDER,  # Path to save training ckpt.
     # load_ckpt_folder= dict(path=MODEL_ONLY_FOLDER, content=["model"], ckpt_type="normal"),
     load_ckpt_folder="local:llm_ckpts/",
@@ -73,10 +74,6 @@ data = dict(
     valid_folder=VALID_FOLDER,
     empty_cache_and_diag_interval=200,
     diag_outlier_ratio=1.1,
-    # whether use shared memory to load meta files
-    use_shm=False,
-    # when use shm, the default shm_path is "/dev/shm/metacache"
-    # shm_path="/dev/shm/metacache"
 )
 
 grad_scaler = dict(
@@ -100,21 +97,17 @@ grad_scaler = dict(
 
 hybrid_zero_optimizer = dict(
     # Enable low_level_optimzer overlap_communication
-    overlap_sync_grad=True,
+    overlap_sync_grad=False,
     overlap_sync_param=False,
     # bucket size for nccl communication params
     reduce_bucket_size=512 * 1024 * 1024,
     # grad clipping
     clip_grad_norm=1.0,
-    # whether use new optm
-    use_split_tensor_optim=False,
-    # when use split tensor optm
-    # Perform all gather with a set of parameters of all_gather_size
-    all_gather_size=512 * 1024 * 1024,
 )
 
 loss = dict(
     label_smoothing=0,
+    moe_loss_coeff=0.001,
 )
 
 adam = dict(
@@ -144,6 +137,8 @@ use_fp32_norm = False
 model = dict(
     checkpoint=False,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
     num_attention_heads=NUM_ATTENTION_HEAD,
+    num_kv_attention_heads=NUM_KV_ATTENTION_HEAD,
+    max_position_embeddings=131072,
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
     embed_grad_scale=1,
@@ -154,7 +149,7 @@ model = dict(
     apply_post_layer_norm=False,
     dtype="torch.bfloat16",  # Support: "torch.float16", "torch.half", "torch.bfloat16", "torch.float32", "torch.tf32"
     norm_type="rmsnorm",
-    layer_norm_epsilon=1e-5,
+    layer_norm_epsilon=1e-6,
     use_flash_attn=True,
     # Whether the odd and even columns of the query and key in the model are normally interleaved.
     # If it's True, the model's odd and even columns are normally ordered; if it's False,
@@ -164,7 +159,13 @@ model = dict(
     # qk_interleaved = True: q[-1] = [q1,q2,q3,q4,q5,q6,...], k[-1] = [k1,k2,k3,k4,k5,k6,...]
     # qk_interleaved = False: q[-1] = [q1,q3,q5,...,q2,q4,q6,...], k[-1] = [k1,k3,k5,...,k2,k4,k6,...]
     qk_interleaved=False,
+    use_sliding_window=False,
+    rope_base=1000000,
     num_chunks=1,  # if num_chunks > 1, interleaved pipeline scheduler is used.
+    moe_type="GShard",  # Support: "GShard", "MegaBlock", "MegaBlock-D", "Dropless"
+    num_experts=64,
+    num_shared_experts=8,
+    top_k=8,
 )
 """
 zero1 parallel (dict):
@@ -183,19 +184,32 @@ tensor parallel (dict):
         fsp: tensor parallel by flash-attn with sequence parallel, sequence parallel size = tensor parallel size.
         isp: customed intern sequence parallel without tensor parallel, can be used with weight parallel.
 pipeline parallel (dict):
-    1. size: int, the size of pipeline parallel (Default is 1F1B).
+    1. size: int, the size of pipeline parallel.
     2. interleaved_overlap: bool, enable/disable communication overlap when using interleaved pipeline scheduler,
         defaults to False.
-    3. zero_bubble: bool, enable/disable zero bubble pipeline parallelism (ZB-H1), defaults to False.
 weight parallel (dict):
     1. size: int, the size of weight parallel.
     2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
+    3. memory_pool: bool, enable/disable memory pool, defaults to False.
+expert parallel (dict):
+    1. size: int
+        * if size <= 0, ep size equals to dp size, but if the number of experts is smaller than dp size, set ep size
+            to be the number of experts to make sure each device has one expert.
+        * if size == 1, all experts are placed in each device, running as dp-only.
+        * if size > 1, all experts are placed in k devices and each device has n/k experts, where n is the total
+            number of experts and k = size.
+expert weight parallel (dict):
+    1. size: int, the size of weight parallel for expert module, distinct with global weight parallel size.
+    2. overlap: bool, enable/disable all_gather/reduce_scatter communication overlap, defaults to False.
+    3. memory_pool: bool, enable/disable memory pool, defaults to False.
 """
 parallel = dict(
-    zero1=dict(size=-1),
+    zero1=dict(size=-1, fsdp=False),
     tensor=dict(size=1, mode="mtp"),
-    pipeline=dict(size=1, interleaved_overlap=True, zero_bubble=False),
-    weight=dict(size=1, overlap=True),
+    pipeline=dict(size=1, interleaved_overlap=True),
+    weight=dict(size=1, overlap=True, memory_pool=True),
+    expert=dict(size=-1, no_tp=False),
+    expert_weight=dict(size=1, overlap=True, memory_pool=True),
 )
 
 cudnn_deterministic = False
@@ -213,9 +227,3 @@ monitor = dict(
         queue_max_length=10,
     ),
 )
-
-use_apex_adam = False
-
-# metric_dtype can be "fp32" or other string
-# only when set to "fp32" will use fp32 to calc in metrics
-# metric_dtype = "fp32"

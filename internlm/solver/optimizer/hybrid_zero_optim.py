@@ -328,7 +328,7 @@ class HybridZeroOptimizer(BaseOptimizer):
                         op_type = (
                             torch.distributed.ReduceOp.SUM
                             if internlm_accelerator.get_accelerator_backend()
-                            in [AcceleratorType.NPU, AcceleratorType.DIPU]
+                            in [AcceleratorType.NPU, AcceleratorType.DIPU, AcceleratorType.DITORCH]
                             else torch.distributed.ReduceOp.AVG
                         )
                         parallel_mode = ParallelMode.WEIGHT if self.use_isp else ParallelMode.TENSOR
@@ -522,7 +522,11 @@ class HybridZeroOptimizer(BaseOptimizer):
         grad_buckets_by_dtype = split_half_float_double(grads)
         next_bucket_list = []
 
-        if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
+        if internlm_accelerator.get_accelerator_backend() in [
+            AcceleratorType.NPU,
+            AcceleratorType.DIPU,
+            AcceleratorType.DITORCH,
+        ]:
             op_type = torch.distributed.ReduceOp.SUM
             avg_size = gpc.get_world_size(dp_parallel_mode)
         else:
@@ -717,7 +721,11 @@ class HybridZeroOptimizer(BaseOptimizer):
         for group_id in range(self.num_param_groups):
             self._reduce_grads_stored_in_bucket(self._bucket_store[group_id], reduce_rank=None)
 
-        if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
+        if internlm_accelerator.get_accelerator_backend() in [
+            AcceleratorType.NPU,
+            AcceleratorType.DIPU,
+            AcceleratorType.DITORCH,
+        ]:
             avg_size = gpc.get_world_size(ParallelMode.DATA)
         else:
             avg_size = -1

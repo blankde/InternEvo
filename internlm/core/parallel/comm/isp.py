@@ -27,6 +27,7 @@ from internlm.core.parallel.comm.utils import (
 )
 from internlm.model.modules.embedding import Embedding1D
 from internlm.model.modules.linear import ParallelLinearWithCommExt
+from internlm.model.modules.utils import is_moe_param
 from internlm.utils.common import SchedulerHook, UniqueChainMap, get_current_device
 from internlm.utils.utils import (
     CuSeqlenType,
@@ -306,10 +307,12 @@ class ISPCommunicator(WPCommunicator):
         model_conf: ISPCommModelConfig,
         overlap: bool = False,
         process_group: dist.ProcessGroup = None,
+        is_moe: bool = False,
     ) -> None:
         self.process_group = process_group
         self.overlap = overlap
         self.model_conf = model_conf
+        self.is_moe = is_moe
         self.is_forward = True
         self.reduce_scatter_handlers = {}
         self._module_shapes = {}
@@ -370,6 +373,8 @@ class ISPCommunicator(WPCommunicator):
                             self._overlap_states[cid].isp_outs.append(child)
                             self._overlap_states[cid].module_to_index[child] = idx
                         if isinstance(child, (ParallelLinearWithCommExt)):
+                            if is_moe_param(child.weight) != self.is_moe:
+                                continue
                             if name not in self._module_shapes:
                                 weight_parallel_size = dist.get_world_size(self.process_group)
                                 origin_shape = tuple(

@@ -63,6 +63,7 @@ from internlm.model.modules.linear import (
 )
 from internlm.model.modules.norm import new_layer_norm
 from internlm.model.moe import Experts, MoE
+from internlm.model.moe.moe import Qwen2MoE
 from internlm.model.ops.norm import RMSNorm
 from internlm.model.registry import register_model_initializer
 from internlm.monitor import set_env_var
@@ -109,6 +110,7 @@ LINEAR2NEWLINEAR_NAME_MAPPING = dict(
     down_proj="w2",
     up_proj="w3",
     lm_head="head",
+    W_pack="wqkv",
 )
 
 logger = get_logger(__file__)
@@ -126,15 +128,22 @@ def set_fp32_attr_for_model(model: Union[nn.Module, nn.ModuleList]):
 
 
 def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
+    def _check_module_pure_dp_wdp(name, module):  # pylint: disable=W0613
+        for param in module.parameters():
+            setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
+
     def _check_module(name, module):
         # layer_norm
         if isinstance(module, (RMSNorm, nn.LayerNorm)):
             for param in module.parameters():
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
-        if isinstance(module, MoE):
+        if isinstance(module, (MoE, Qwen2MoE)):
             for param in module.moe_layer.gate.parameters():
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
+            if hasattr(module, "coefficient"):
+                for param in module.coefficient.parameters():
+                    setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
         # embedding and head
         if isinstance(module, (Embedding1D, ScaleColumnParallelLinear)):
@@ -145,6 +154,10 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
                     setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
 
         # for moe linear module
+        if isinstance(module, nn.Linear) and not isinstance(module, ParallelLinearWithCommExt):
+            for param in module.parameters():
+                setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
+
         if isinstance(module, Experts):
             for param in module.parameters():
                 if (
@@ -171,9 +184,16 @@ def set_parallel_attr_for_param_groups(model: Union[nn.Module, nn.ModuleList]):
                 setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 
     for _chunk in unwrap_naive_amp(model):
+        # special case for pure dp or pure wdp mode
+        if gpc.get_world_size(ParallelMode.DATA) == gpc.get_world_size(ParallelMode.GLOBAL) and gpc.get_world_size(
+            ParallelMode.WEIGHT_DATA
+        ) == gpc.get_world_size(ParallelMode.GLOBAL):
+            _check_module_func = _check_module_pure_dp_wdp
+        else:
+            _check_module_func = _check_module
         # set param parallel attribute
         for name, module in _chunk.named_modules():
-            _check_module(name, module)
+            _check_module_func(name, module)
 
         for name, param in _chunk.named_parameters():
             assert (
@@ -219,7 +239,6 @@ def inject_model(model):
         torch.nn.Module:
             The injected neural network model to be trained or evaluated.
     """
-
     if hasattr(model, IS_INJECTED) and getattr(model, IS_INJECTED):
         return model
 
@@ -305,6 +324,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
             ),
             gpc.config.parallel.weight.overlap,
             gpc.get_group(ParallelMode.WEIGHT),
+            is_moe=False,
         )
         # register communicator for isp column parallel linear.
         ColumnParallelLinear.register_cls_communicator(isp_communicator)
@@ -329,6 +349,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
                 ),
                 gpc.config.parallel.expert_weight.overlap,
                 gpc.get_group(ParallelMode.EXPERT_WEIGHT),
+                is_moe=True,
             )
             for moe in _submodule_filter(model, Experts):
                 for column_linear in _submodule_filter(moe, (ColumnParallelLinear, GroupedWPLinear)):
@@ -458,6 +479,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
     adam_cfg = gpc.config.adam
     zero_cfg = gpc.config.hybrid_zero_optimizer
     grad_scal_cfg = gpc.config.grad_scaler
+    use_apex_adam = getattr(gpc.config, "use_apex_adam", False)
 
     if "use_split_tensor_optim" in zero_cfg and zero_cfg.use_split_tensor_optim:
         map_param_block(model)
@@ -469,6 +491,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
         lr=adam_cfg.lr,
         betas=(adam_cfg.adam_beta1, adam_cfg.adam_beta2),
         eps=adam_cfg.adam_eps,
+        use_apex_adam=use_apex_adam,
     )
 
     if (
@@ -894,27 +917,36 @@ def inject_norm(model: nn.Module, inject=False, interactive=False) -> None:
 
 
 def inject_config(model: nn.Module) -> None:
-    gpc.config.model.vocab_size = gpc.config.VOCAB_SIZE = model.config.vocab_size
-    gpc.config.model.hidden_size = gpc.config.HIDDEN_SIZE = model.config.hidden_size
-    gpc.config.model.num_layers = gpc.config.NUM_LAYER = model.config.num_hidden_layers
-    gpc.config.model.num_attention_heads = gpc.config.NUM_ATTENTION_HEAD = model.config.num_attention_heads
-    gpc.config.model.mlp_ratio = gpc.config.MLP_RATIO = model.config.intermediate_size / model.config.hidden_size
+    if hasattr(model.config, "text_config"):
+        model_config = model.config.text_config
+    else:
+        model_config = model.config
+    gpc.config.model.vocab_size = gpc.config.VOCAB_SIZE = model_config.vocab_size
+    gpc.config.model.hidden_size = gpc.config.HIDDEN_SIZE = model_config.hidden_size
+    gpc.config.model.num_layers = gpc.config.NUM_LAYER = model_config.num_hidden_layers
+    gpc.config.model.num_attention_heads = gpc.config.NUM_ATTENTION_HEAD = model_config.num_attention_heads
+    gpc.config.model.mlp_ratio = gpc.config.MLP_RATIO = model_config.intermediate_size / model_config.hidden_size
     # For models that use GQA
-    if hasattr(model.config, "num_key_value_heads"):
-        gpc.config.model.num_kv_attention_heads = gpc.config.NUM_KV_ATTENTION_HEAD = model.config.num_key_value_heads
+    if hasattr(model_config, "num_key_value_heads"):
+        gpc.config.model.num_kv_attention_heads = gpc.config.NUM_KV_ATTENTION_HEAD = model_config.num_key_value_heads
 
 
-def inject_model_helper(model: nn.Module, inject_info: Optional[Dict] = None) -> None:
-    inject = False
-    interactive = False
-    modules = []
-    reset_params = False
-
+def inject_model_helper(model: Union[nn.Module, nn.ModuleList], inject_info: Optional[Dict] = None) -> None:
+    # get inject_info
     if inject_info is not None:
         inject = inject_info.get("inject", False)
         interactive = inject_info.get("interactive", False)
         modules = inject_info.get("modules", [])
         reset_params = inject_info.get("reset_params", False)
+        extra_linear2newlinear = inject_info.get("extra_linear2newlinear", {})
+    else:
+        inject = False
+        interactive = False
+        modules = []
+        reset_params = False
+        extra_linear2newlinear = {}
+
+    LINEAR2NEWLINEAR_NAME_MAPPING.update(extra_linear2newlinear)
 
     inject_funcs = {
         "embed": inject_embed,
@@ -922,15 +954,28 @@ def inject_model_helper(model: nn.Module, inject_info: Optional[Dict] = None) ->
         "norm": inject_norm,
     }
 
-    for mod in modules:
-        inject_funcs[mod](model, inject, interactive)
+    if not isinstance(model, nn.ModuleList):
+        model = [model]
 
+    # inject modules
+    for _chunk in model:
+        if gpc.get_world_size(ParallelMode.DATA) == gpc.get_world_size(ParallelMode.GLOBAL) and gpc.get_world_size(
+            ParallelMode.WEIGHT_DATA
+        ) == gpc.get_world_size(ParallelMode.GLOBAL):
+            continue
+        for mod in modules:
+            inject_funcs[mod](_chunk, inject, interactive)
+
+    # reset parameters and move model to device
+    for _chunk in model:
+        if inject:
+            if reset_params:
+                _chunk.reset_parameters()
+            _chunk.to(get_current_device())
+
+    # inject configs
     if inject:
-        if reset_params:
-            model.reset_parameters()
-
-        inject_config(model)
-
+        inject_config(model[0])
         if gpc.is_rank_for_log():
             logger.info(
                 f"inject is enabled, please check the model carefully, "

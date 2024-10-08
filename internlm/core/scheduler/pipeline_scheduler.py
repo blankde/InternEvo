@@ -115,6 +115,7 @@ class WeightGradStore:
     When using zero bubble pp, WeightGradStore is used to store the args and func for computating weight grad.
     """
 
+    cache = []
     weight_grad_queue = queue.Queue()
 
     @classmethod
@@ -123,25 +124,37 @@ class WeightGradStore:
 
     @classmethod
     def put(cls, weight, bias, input_tensor, grad_output, has_d_bias, grad_compute_func, *args):
+        assert not gpc.is_first_rank(ParallelMode.PIPELINE), "pp rank 0 should not arrive here"
         # Store the weight gradient computation of linear layers.
-        cls.weight_grad_queue.put((weight, bias, input_tensor, grad_output, has_d_bias, grad_compute_func, *args))
+        cls.cache.append((weight, bias, input_tensor, grad_output, has_d_bias, grad_compute_func, *args))
+
+    @classmethod
+    def flush(cls):
+        if gpc.is_first_rank(ParallelMode.PIPELINE):
+            return
+        # Collect all stored computations during backward as a W for each micro batch.
+        cls.weight_grad_queue.put(cls.cache)
+        cls.cache = []
 
     @classmethod
     def pop(cls):
-        # Run computation for a single W.
+        if gpc.is_first_rank(ParallelMode.PIPELINE):
+            return
         assert cls.weight_grad_queue.qsize() > 0
-        weight, bias, input_tensor, grad_output, has_d_bias, grad_compute_func, *args = cls.weight_grad_queue.get()
-        grad_weight, grad_bias = grad_compute_func(input_tensor, grad_output, has_d_bias)
-        if is_using_isp():
-            isp_grad_hook = args[0]
-            grad_weight, _ = isp_grad_hook(grad_weight, async_op=False, is_bias=False)
-            if grad_bias is not None:
-                grad_bias, _ = isp_grad_hook(grad_bias, async_op=False, is_bias=True)
+        stored_w_grad_computation = cls.weight_grad_queue.get()
+        # Run computation for a single W.
+        for weight, bias, input_tensor, grad_output, has_d_bias, grad_compute_func, *args in stored_w_grad_computation:
+            grad_weight, grad_bias = grad_compute_func(input_tensor, grad_output, has_d_bias)
+            if is_using_isp():
+                isp_grad_hook = args[0]
+                grad_weight, _ = isp_grad_hook(grad_weight, async_op=False, is_bias=False)
+                if grad_bias is not None:
+                    grad_bias, _ = isp_grad_hook(grad_bias, async_op=False, is_bias=True)
 
-        # Gradient Accumulation
-        weight.grad = weight.grad + grad_weight if weight.grad is not None else grad_weight
-        if has_d_bias:
-            bias.grad = bias.grad + grad_bias if bias.grad is not None else grad_bias
+            # Gradient Accumulation
+            weight.grad = weight.grad + grad_weight if weight.grad is not None else grad_weight
+            if has_d_bias:
+                bias.grad = bias.grad + grad_bias if bias.grad is not None else grad_bias
 
 
 class PipelineScheduler(BaseScheduler):
@@ -951,6 +964,7 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
                         scatter_gather_tensors=self.scatter_gather_tensors,
                     )
 
+            WeightGradStore.flush()
             if i >= gpc.get_local_rank(ParallelMode.PIPELINE):
                 WeightGradStore.pop()
 
@@ -976,8 +990,8 @@ class ZeroBubblePipelineScheduler(PipelineScheduler):
             if not gpc.is_first_rank(ParallelMode.PIPELINE):
                 comm.send_backward(input_obj_grad, scatter_gather_tensors=self.scatter_gather_tensors)
 
-            if WeightGradStore.size() > 0:
-                WeightGradStore.pop()
+            WeightGradStore.flush()
+            WeightGradStore.pop()
 
         while WeightGradStore.size() > 0:
             WeightGradStore.pop()

@@ -60,6 +60,7 @@ def _get_scatter_sum_impl():
     if cuda_scatter_impl and internlm_accelerator.get_accelerator_backend() in (
         AcceleratorType.GPU,
         AcceleratorType.DIPU,
+        AcceleratorType.DITORCH,
     ):
         if gpc.is_rank_for_log():
             logger.warning("Use cuda_scatter. Please note this!")
@@ -158,7 +159,8 @@ class AccPerplex:
             logits_global = logits_max == torch.max(shift_logits, dim=-1)[0]
 
             corrects = torch.logical_and(
-                (shift_labels == (shift_logits.argmax(dim=-1) + pred_shift)), logits_global
+                (shift_labels == (shift_logits.argmax(dim=-1) + pred_shift)),
+                logits_global,
             ).long()
             mask = shift_labels.ne(-100).long()
             if hasattr(self, "total_type_count"):
@@ -167,7 +169,10 @@ class AccPerplex:
                 if len(ds_acc) < self.total_type_count:
                     ds_acc = torch.cat([ds_acc, ds_acc.new_zeros(self.total_type_count - len(ds_acc))])
                     token_num_type = torch.cat(
-                        [token_num_type, token_num_type.new_zeros(self.total_type_count - len(token_num_type))]
+                        [
+                            token_num_type,
+                            token_num_type.new_zeros(self.total_type_count - len(token_num_type)),
+                        ]
                     )
                 self.ds_tokens += token_num_type
                 sync_tensor = ds_acc
@@ -177,7 +182,11 @@ class AccPerplex:
             acc = corrects.sum()
             torch.distributed.all_reduce(acc, op=torch.distributed.ReduceOp.SUM, group=self.tp_pg)
             # The synchronization here is to prevent unpredictable HANG when the NPU is running.
-            if internlm_accelerator.get_accelerator_backend() in [AcceleratorType.NPU, AcceleratorType.DIPU]:
+            if internlm_accelerator.get_accelerator_backend() in [
+                AcceleratorType.NPU,
+                AcceleratorType.DIPU,
+                AcceleratorType.DITORCH,
+            ]:
                 internlm_accelerator.current_stream().synchronize()
             self.right += acc  # Masked_fill is not needed here because -100 is not available anyway
             self.total += mask.sum()
@@ -223,12 +232,20 @@ class AccPerplex:
         if gpc.is_no_pp_or_last_stage() and self.dp_pg is not None:
             torch.distributed.all_reduce(self.right, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
             torch.distributed.all_reduce(self.total, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
-            torch.distributed.all_reduce(self.total_log_probs, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
+            torch.distributed.all_reduce(
+                self.total_log_probs,
+                op=torch.distributed.ReduceOp.SUM,
+                group=self.dp_pg,
+            )
             if hasattr(self, "total_type_count"):
                 torch.distributed.all_reduce(self.ds_right, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
                 torch.distributed.all_reduce(self.ds_tokens, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
             if self.tokenizer:
-                torch.distributed.all_reduce(self.total_bytes, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
+                torch.distributed.all_reduce(
+                    self.total_bytes,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.dp_pg,
+                )
 
         acc = round((self.right / self.total).item(), 4)
         perplexity = round(torch.exp(self.total_log_probs / self.total).item(), 4)
@@ -239,7 +256,8 @@ class AccPerplex:
             ds_tokens = {}
             for i in range(self.total_type_count):
                 ds_acc[f"acc/{self.dataset_types[i]}"] = round(
-                    (self.ds_right[i].float() / (self.ds_tokens[i].float() + 1e-5)).item(), 4
+                    (self.ds_right[i].float() / (self.ds_tokens[i].float() + 1e-5)).item(),
+                    4,
                 )
                 ds_tokens[f"tokens/{self.dataset_types[i]}"] = self.ds_tokens[i].item()
         if reset:
@@ -319,10 +337,16 @@ class LossWithTypeId:
 
                 if len(loss_list_type) < self.total_type_count:
                     loss_list_type = torch.cat(
-                        [loss_list_type, loss_list_type.new_zeros(self.total_type_count - len(loss_list_type))]
+                        [
+                            loss_list_type,
+                            loss_list_type.new_zeros(self.total_type_count - len(loss_list_type)),
+                        ]
                     )
                     token_num_type = torch.cat(
-                        [token_num_type, token_num_type.new_zeros(self.total_type_count - len(token_num_type))]
+                        [
+                            token_num_type,
+                            token_num_type.new_zeros(self.total_type_count - len(token_num_type)),
+                        ]
                     )
                 self.ds_loss += loss_list_type
                 self.ds_token_num += token_num_type
@@ -333,7 +357,11 @@ class LossWithTypeId:
             torch.distributed.all_reduce(self.token_num, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
             if hasattr(self, "total_type_count"):
                 torch.distributed.all_reduce(self.ds_loss, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
-                torch.distributed.all_reduce(self.ds_token_num, op=torch.distributed.ReduceOp.SUM, group=self.dp_pg)
+                torch.distributed.all_reduce(
+                    self.ds_token_num,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.dp_pg,
+                )
 
         loss = round((self.loss / self.token_num).item(), 4)
         res = {

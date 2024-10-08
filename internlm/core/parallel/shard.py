@@ -31,11 +31,11 @@ def _split_data_for_sequence_parallel(data, label):
         and gpc.config.parallel["tensor"].get("mode", TensorParallelMode.mtp.name) == TensorParallelMode.isp.name
     ):
         data["indexes"] = _split(data["indexes"], ParallelMode.TENSOR, dim=_indexes_seq_dim)
-    if (
-        "position_ids" in data
-        and gpc.config.parallel["tensor"].get("mode", TensorParallelMode.mtp.name) == TensorParallelMode.isp.name
-    ):
-        data["position_ids"] = _split(data["position_ids"], ParallelMode.TENSOR, dim=_indexes_seq_dim)
+
+    # NOTICE: For compatibility where the shape of position_ids is [batch, seqlen, ...]
+    if "inject_info" in gpc.config.model and gpc.config.model.inject_info.get("data_helper", False):
+        _position_ids_seq_dim = 1
+        data["position_ids"] = _split(data["position_ids"], ParallelMode.TENSOR, dim=_position_ids_seq_dim)
 
     data["input_ids"] = _split(data["input_ids"], ParallelMode.TENSOR, dim=_seq_dim)
 
@@ -158,7 +158,11 @@ def get_parallel_strategies_split_mode(linear_name: str) -> str:
 
     if linear_name in ("head", "output"):
         return "head"
+    if linear_name in ("gate"):
+        return "gate"  # for MoE model
     elif linear_name in ("wqkv", "wq", "wk", "wv", "wkv", "w1", "w3", "w13"):
+        return "column"
+    elif linear_name in ("fc1", "fc2", "linear_1", "linear_2"):  # for vit model
         return "column"
     elif linear_name in ("wo", "out_proj", "w2") and tp_mode == TensorParallelMode.isp.name:
         return "column"

@@ -73,6 +73,9 @@ def args_sanity_check():
     if "model_type" not in gpc.config:
         gpc.config._add_item("model_type", ModelType.INTERNLM.name)
 
+    if "use_apex_adam" not in gpc.config:
+        gpc.config._add_item("use_apex_adam", False)
+
     # procssing the parallel config in gpc
     if "zero1" not in gpc.config.parallel:
         gpc.config.parallel._add_item("zero1", dict(size=-1, fsdp=False))
@@ -400,6 +403,7 @@ def args_sanity_check():
     ] == TensorParallelMode.isp.name and internlm_accelerator.get_accelerator_backend() in [
         AcceleratorType.NPU,
         AcceleratorType.DIPU,
+        AcceleratorType.DITORCH,
     ]:
         assert (
             gpc.config.data.use_packed_dataset is False
@@ -408,6 +412,7 @@ def args_sanity_check():
     if internlm_accelerator.get_accelerator_backend() in [
         AcceleratorType.NPU,
         AcceleratorType.DIPU,
+        AcceleratorType.DITORCH,
     ]:
         assert (
             gpc.config.model.use_flash_attn == gpc.config.data.use_packed_dataset

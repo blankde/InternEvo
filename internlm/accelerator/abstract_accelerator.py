@@ -10,7 +10,8 @@ class AcceleratorType(enum.Enum):
     NPU = 2
     CPU = 3
     DIPU = 4
-    OTHER = 5
+    DITORCH = 5
+    OTHER = 6
 
 
 internlm_accelerator = None
@@ -81,7 +82,15 @@ def get_accelerator():
 
     accelerator_name = None
     # 1. Detect whether there is override of DeepSpeed accelerators from environment variable.
-    intern_accelerator_LIST = ["cuda", "npu", "dipu"]
+    # 2. ditorch: a unified accelerator tools for torch_npu, torch_dipu backend etc.
+    #    deeplink_ext: implemented FlashSelfAttention, FlashCrossAttention, RmsNorm and RotaryEmbedding operations
+    #           etc. based on torch_dipu and torch_npu backend, respectively.
+    #    ditorch, together with deeplink_ext, provides unified APIs for internlm training.
+    #    usage:
+    #       for torch_dipu backend: export INTERNLM_ACCELERATOR=ditorch; export DEEPLINK_EXT_PLATFORM_TYPE=torch_dipu
+    #       for torch_npu backend: export INTERNLM_ACCELERATOR=ditorch; export DEEPLINK_EXT_PLATFORM_TYPE=torch_npu
+
+    intern_accelerator_LIST = ["cuda", "npu", "dipu", "ditorch"]
     if "INTERNLM_ACCELERATOR" in os.environ:
         accelerator_name = os.environ["INTERNLM_ACCELERATOR"]
         if accelerator_name == "npu":
@@ -99,6 +108,15 @@ def get_accelerator():
                     "DIPU_Accelerator requires torch_dipu and deeplink_ext, which is not installed on this system."
                 )
             pass
+        elif accelerator_name == "ditorch":
+            try:
+                import deeplink_ext  # pylint: disable=unused-import
+                import ditorch  # pylint: disable=unused-import
+            except (ImportError, ModuleNotFoundError):
+                raise ValueError(
+                    "DIPU_Accelerator requires ditorch and deeplink_ext, which is not installed on this system."
+                )
+            pass
         elif accelerator_name != "cuda":
             raise ValueError(
                 f"accelerator_name must be one of {intern_accelerator_LIST}."
@@ -106,6 +124,14 @@ def get_accelerator():
             )
 
     # 2. If no override, detect which accelerator to use automatically
+    if accelerator_name is None:
+        try:
+            import deeplink_ext  # noqa: F401,F811 # type: ignore
+            import ditorch  # noqa: F401,F811 # type: ignore
+
+            accelerator_name = "ditorch"
+        except (ImportError, ModuleNotFoundError):
+            pass
     if accelerator_name is None:
         try:
             import deeplink_ext  # noqa: F401,F811 # type: ignore
@@ -137,5 +163,9 @@ def get_accelerator():
         from .dipu_accelerator import DIPU_Accelerator
 
         internlm_accelerator = DIPU_Accelerator()
+    elif accelerator_name == "ditorch":
+        from .ditorch_accelerator import DITORCH_Accelerator
+
+        internlm_accelerator = DITORCH_Accelerator()
 
     return internlm_accelerator

@@ -107,6 +107,7 @@ class Llama2Decoder(nn.Module):
         rope_base: int = 10000,
         mlp_layer_fusion: bool = False,
         multiple_of: int = 256,
+        enable_qkv_fusion: bool = False,
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -138,7 +139,7 @@ class Llama2Decoder(nn.Module):
             qk_interleaved=qk_interleaved,
             bias=not no_bias,
             rope_base=rope_base,
-            enable_qkv_fusion=False,
+            enable_qkv_fusion=enable_qkv_fusion,
         )
 
         self.dropout1 = nn.Dropout(drop_rate)
@@ -363,6 +364,7 @@ class Llama2(BaseModel):
         rope_base: int = 10000,
         mlp_layer_fusion: bool = False,
         multiple_of: int = 256,
+        enable_qkv_fusion: bool = False,
     ):
         super().__init__()
 
@@ -410,6 +412,7 @@ class Llama2(BaseModel):
                     rope_base=rope_base,
                     mlp_layer_fusion=mlp_layer_fusion,
                     multiple_of=multiple_of,
+                    enable_qkv_fusion=enable_qkv_fusion,
                 )
                 for lid in range(num_layers)
             ]
@@ -571,8 +574,6 @@ class Llama2(BaseModel):
             new_state_dict["norm.weight"] = state_dict.pop("model.norm.weight")
 
         missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-        if len(state_dict) > 0:
-            logger.warning(f"Be cautious, checkpoint state_dict keys={state_dict.keys()} have not beed loaded.")
 
         if gpc.get_local_rank(ParallelMode.DATA) == 0:
             pp_rank = 0 if not gpc.is_initialized(ParallelMode.PIPELINE) else gpc.get_local_rank(ParallelMode.PIPELINE)

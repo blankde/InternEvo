@@ -1,11 +1,9 @@
 # Copyright (c) InternLM. All rights reserved.
 import math
-import os
 from typing import Optional
 
 import torch
 from torch import nn
-from tqdm import tqdm
 
 from internlm.accelerator import get_accelerator
 from internlm.core.context import ParallelMode
@@ -22,24 +20,19 @@ from internlm.model.modules.linear import new_linear
 from internlm.model.modules.mha import SWA
 from internlm.model.modules.mlp import new_feed_forward
 from internlm.model.modules.norm import new_layer_norm
+from internlm.model.moe.moe import Qwen2MoE
 from internlm.model.utils import (
     convert_attn_args_to_kwargs,
     convert_attn_kwargs_to_args,
 )
 from internlm.solver.activation_checkpoint import activation_checkpoint
 from internlm.utils.logger import get_logger
-from internlm.utils.storage_manager import get_fns, llm_load, llm_save
-from transformers.modeling_utils import (
-    SAFE_WEIGHTS_INDEX_NAME,
-    SAFE_WEIGHTS_NAME,
-    shard_checkpoint,
-)
 
 internlm_accelerator = get_accelerator()
 logger = get_logger(__file__)
 
 
-class Qwen2Decoder(nn.Module):
+class Qwen2MoeDecoder(nn.Module):
     """
     1D Packed Flash Qwen Layer.
 
@@ -106,6 +99,10 @@ class Qwen2Decoder(nn.Module):
         multiple_of: int = 256,
         scale_attn_weights: bool = False,  # Qwen1
         use_logn_attn: bool = False,  # Qwen1
+        num_experts: int = 1,
+        top_k: int = 1,
+        num_shared_experts: int = 0,
+        moe_layer_kwargs: dict = None,
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -156,17 +153,36 @@ class Qwen2Decoder(nn.Module):
         self.attention_norm = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
         self.ffn_norm = new_layer_norm(norm_type, hidden_size, eps=layer_norm_epsilon)
 
-        self.feed_forward = new_feed_forward(
-            hidden_size,
-            int(hidden_size * mlp_ratio),
-            out_features=hidden_size,
-            bias=mlp_bias,
-            device=device,
-            dtype=dtype,
-            mlp_layer_fusion=mlp_layer_fusion,
-            multiple_of=multiple_of,
-            activation_type="swiglu" if use_swiglu else "gelu",
-        )
+        self.num_experts = num_experts
+        if num_experts <= 1:  # dense, not MoE
+            self.feed_forward = new_feed_forward(
+                hidden_size,
+                int(hidden_size * mlp_ratio),
+                out_features=hidden_size,
+                bias=mlp_bias,
+                device=device,
+                dtype=dtype,
+                mlp_layer_fusion=mlp_layer_fusion,
+                multiple_of=multiple_of,
+                activation_type="swiglu" if use_swiglu else "gelu",
+            )
+        else:
+            # replace mlp by MoE module. The expert in MoE is a FeedForward module.
+            # mlp_cls = get_mlp_cls(self.tp_mode)
+            self.feed_forward = Qwen2MoE(
+                hidden_size,
+                int(hidden_size * mlp_ratio),
+                out_features=hidden_size,
+                num_experts=num_experts,
+                top_k=top_k,
+                num_shared_experts=num_shared_experts,
+                moe_layer_kwargs=moe_layer_kwargs,
+                device=device,
+                dtype=dtype,
+                mlp_layer_fusion=mlp_layer_fusion,
+                multiple_of=multiple_of,
+                activation_type="swiglu" if use_swiglu else "gelu",
+            )
 
         self.use_swiglu = use_swiglu
         self.use_scaled_init = use_scaled_init
@@ -266,9 +282,14 @@ class Qwen2Decoder(nn.Module):
 
                     if self.residual_in_fp32:
                         residual = residual.to(torch.float32)
-                hidden_states = self.feed_forward(hidden_states)
 
-            return hidden_states + residual
+                if self.num_experts <= 1:  # dense mlp output
+                    hidden_states = self.feed_forward(hidden_states)
+                    moe_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+                else:  # MoE output
+                    hidden_states, moe_loss, _ = self.feed_forward(hidden_states)
+
+            return hidden_states + residual, moe_loss
         else:
             assert residual is None
 
@@ -279,16 +300,21 @@ class Qwen2Decoder(nn.Module):
                 dtype=self.attention_norm.weight.dtype
             )
             if not isinstance(self.feed_forward, nn.Identity):
-                mlp_out = self.feed_forward(hidden_states)
+                if self.num_experts <= 1:  # dense mlp output
+                    mlp_out = self.feed_forward(hidden_states)
+                    moe_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+                else:  # MoE output
+                    mlp_out, moe_loss, _ = self.feed_forward(hidden_states)
+
                 if self.return_residual:  # mlp out is actually a pair here
                     mlp_out, hidden_states = mlp_out
                 hidden_states = self.ffn_norm((self.dropout2(mlp_out)) + hidden_states).to(
                     dtype=self.ffn_norm.weight.dtype
                 )
-            return hidden_states
+            return hidden_states, moe_loss
 
 
-class Qwen2(BaseModel):
+class Qwen2Moe(BaseModel):
     """
     1D Packed Flash Qwen.
 
@@ -374,6 +400,11 @@ class Qwen2(BaseModel):
         multiple_of: int = 256,
         scale_attn_weights: bool = False,  # Qwen1
         use_logn_attn: bool = False,  # Qwen1
+        moe_type: str = None,  # pylint: disable=W0613
+        num_experts: bool = 1,
+        top_k: int = 1,
+        num_shared_experts: int = 0,
+        moe_layer_kwargs: dict = None,
     ):
         super().__init__()
 
@@ -391,7 +422,7 @@ class Qwen2(BaseModel):
 
         self.layers = nn.ModuleList(
             [
-                Qwen2Decoder(
+                Qwen2MoeDecoder(
                     hidden_size=hidden_size,
                     num_attention_heads=num_attention_heads,
                     num_kv_attention_heads=num_kv_attention_heads,
@@ -430,6 +461,10 @@ class Qwen2(BaseModel):
                     max_position_embeddings=max_position_embeddings,
                     scale_attn_weights=scale_attn_weights,
                     use_logn_attn=use_logn_attn,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    num_shared_experts=num_shared_experts,
+                    moe_layer_kwargs=moe_layer_kwargs,
                 )
                 for lid in range(num_layers)
             ]
@@ -484,19 +519,22 @@ class Qwen2(BaseModel):
 
     def forward(self, hidden_states=None, input_ids=None, **kwargs):
         # attention_mask: compute attention on the places where the value is 1
-        if hasattr(self, "embed_tokens"):
+        # old condition may fail when use shared embedding
+        if gpc.is_pipeline_first_stage() and input_ids is not None:
             hidden_states = self.embed_tokens(input_ids)
             if self.embed_grad_scale != 1:
                 hidden_states = (
                     self.embed_grad_scale * hidden_states + (1 - self.embed_grad_scale) * hidden_states.detach()
                 )
 
+        moe_losses = []
         for _, block in enumerate(self.layers):
-            hidden_states = block(
+            hidden_states, moe_loss = block(
                 hidden_states,
                 residual=None,
                 **kwargs,
             )
+            moe_losses.append(moe_loss)
 
         if hasattr(self, "norm"):
             hidden_states = self.norm(hidden_states.to(self.norm.weight.dtype))
@@ -508,243 +546,14 @@ class Qwen2(BaseModel):
             hidden_states = self.output(hidden_states)
 
         if extra_hidden_states_list is not None:
-            return (hidden_states, extra_hidden_states_list)
+            return (hidden_states, extra_hidden_states_list), moe_losses
 
-        return hidden_states
+        return hidden_states, moe_losses
 
     @staticmethod
     def load_hf_weights(folder: str, model: nn.Module) -> None:
-        assert folder is not None, "Please specify the folder of the pretrained model"
-        if gpc.is_rank_for_log():
-            logger.info(f"Loading pretrained model from {folder}")
-
-        fns = get_fns(folder)
-        model_fns = [
-            os.path.join(folder, fn)
-            for fn in fns
-            if (fn.endswith(".bin") and fn.startswith("pytorch_model"))
-            or (fn.endswith(".safetensors") and fn.startswith("model"))
-        ]
-        model_fns.sort()
-
-        state_dict = {}
-        for model_fn in model_fns:
-            state_dict.update(llm_load(model_fn, map_location="cpu"))
-
-        tp_size = gpc.get_world_size(ParallelMode.TENSOR)
-        tp_rank = gpc.get_local_rank(ParallelMode.TENSOR)
-        wp_size = gpc.get_world_size(ParallelMode.WEIGHT)
-        wp_rank = gpc.get_local_rank(ParallelMode.WEIGHT)
-        tp_mode = gpc.config.parallel.tensor["mode"]
-        split_size = wp_size if tp_mode == "isp" else tp_size
-        local_rank = wp_rank if tp_mode == "isp" else tp_rank
-        row_dim = 0 if tp_mode == "isp" else 1
-        if gpc.config.model.get("embed_split_hidden", True):
-            embed_concat_dim = 1
-        else:
-            embed_concat_dim = 0
-
-        new_state_dict = {}
-
-        # embedding
-        if (gpc.get_local_rank(ParallelMode.PIPELINE) == 0) or (not gpc.is_using_parallel_mode(ParallelMode.PIPELINE)):
-            new_state_dict["embed_tokens.weight"] = torch.chunk(
-                state_dict.pop("model.embed_tokens.weight"),
-                split_size,
-                dim=embed_concat_dim,
-            )[local_rank]
-
-        for idx, i in enumerate(range(model.first_layer, model.last_layer)):
-            layer_ids = i
-
-            # attn
-            state_dict[f"layers.{i}.attention.wq.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.q_proj.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wq.bias"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.q_proj.bias"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wk.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.k_proj.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wk.bias"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.k_proj.bias"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wv.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.v_proj.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wv.bias"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.v_proj.bias"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.attention.wo.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.self_attn.o_proj.weight"),
-                split_size,
-                dim=row_dim,
-            )[local_rank]
-
-            # ffn
-            state_dict[f"layers.{i}.feed_forward.w1.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.mlp.gate_proj.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.feed_forward.w3.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.mlp.up_proj.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            state_dict[f"layers.{i}.feed_forward.w2.weight"] = torch.chunk(
-                state_dict.pop(f"model.layers.{layer_ids}.mlp.down_proj.weight"),
-                split_size,
-                dim=row_dim,
-            )[local_rank]
-
-            # attn norm
-            state_dict[f"layers.{i}.attention_norm.weight"] = state_dict.pop(
-                f"model.layers.{layer_ids}.input_layernorm.weight"
-            )
-            # ffn norm
-            state_dict[f"layers.{i}.ffn_norm.weight"] = state_dict.pop(
-                f"model.layers.{layer_ids}.post_attention_layernorm.weight"
-            )
-
-            # replace value within decoder layer
-            for name in list(state_dict.keys()):
-                if name.startswith(f"layers.{i}"):
-                    new_state_dict[name.replace(f".{i}.", f".{idx}.")] = state_dict.pop(name)
-
-        # output
-        if gpc.is_last_rank(ParallelMode.PIPELINE):
-            new_state_dict["output.weight"] = torch.chunk(
-                state_dict.pop("lm_head.weight"),
-                split_size,
-                dim=0,
-            )[local_rank]
-            new_state_dict["norm.weight"] = state_dict.pop("model.norm.weight")
-
-        missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-
-        if gpc.get_local_rank(ParallelMode.DATA) == 0:
-            pp_rank = 0 if not gpc.is_initialized(ParallelMode.PIPELINE) else gpc.get_local_rank(ParallelMode.PIPELINE)
-            logger.info(
-                f"Missing keys:{missing_keys}, unexpected keys:{unexpected_keys} in "
-                f"tp:{gpc.get_local_rank(ParallelMode.TENSOR)}, pp:{pp_rank}"
-            )
-
-        internlm_accelerator.empty_cache()
+        raise NotImplementedError
 
     @staticmethod
     def convert_internevo2hf_weights(src: str, tgt: str) -> None:
-        model_config = gpc.config.model
-        tp_mode = gpc.config.parallel.tensor["mode"]
-        row_dim = 0 if tp_mode == "isp" else 1
-
-        # load states
-        states, num_shards = Qwen2.load_sharded_states(src)
-
-        # convert state_dict
-        state_dict = {}
-        embedding_key_list = ["tok_embeddings.weight", "embed_tokens.weight", None]
-        for layer_i in tqdm(range(model_config["num_layers"])):
-            # attn norm, mlp norm
-            state_dict.update(
-                {
-                    f"model.layers.{layer_i}.input_layernorm.weight": states[0][
-                        f"layers.{layer_i}.attention_norm.weight"
-                    ].clone(),
-                    f"model.layers.{layer_i}.post_attention_layernorm.weight": states[0][
-                        f"layers.{layer_i}.ffn_norm.weight"
-                    ].clone(),
-                }
-            )
-            # attn wqkv weight and bias
-            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wq.weight"] for i in range(num_shards)],
-                dim=0,
-            )
-            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.bias"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wq.bias"] for i in range(num_shards)],
-                dim=0,
-            )
-            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wk.weight"] for i in range(num_shards)],
-                dim=0,
-            )
-            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.bias"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wk.bias"] for i in range(num_shards)],
-                dim=0,
-            )
-            state_dict[f"model.layers.{layer_i}.self_attn.v_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wv.weight"] for i in range(num_shards)],
-                dim=0,
-            )
-            state_dict[f"model.layers.{layer_i}.self_attn.v_proj.bias"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wv.bias"] for i in range(num_shards)],
-                dim=0,
-            )
-            # attn wo weight
-            state_dict[f"model.layers.{layer_i}.self_attn.o_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.attention.wo.weight"] for i in range(num_shards)], dim=row_dim
-            )
-
-            # mlp
-            state_dict[f"model.layers.{layer_i}.mlp.gate_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.feed_forward.w1.weight"] for i in range(num_shards)], dim=0
-            )
-            state_dict[f"model.layers.{layer_i}.mlp.down_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.feed_forward.w2.weight"] for i in range(num_shards)], dim=row_dim
-            )
-            state_dict[f"model.layers.{layer_i}.mlp.up_proj.weight"] = torch.cat(
-                [states[i][f"layers.{layer_i}.feed_forward.w3.weight"] for i in range(num_shards)], dim=0
-            )
-
-        # embedding, head
-        for embedding_key in embedding_key_list:
-            if embedding_key in states[0]:
-                break
-        if embedding_key is None:
-            raise KeyError("Cannot find embedding key!")
-        if model_config["embed_split_hidden"]:
-            embed_concat_dim = 1
-            tok_emb_list = [states[i][embedding_key] for i in range(num_shards)]
-        else:
-            embed_concat_dim = 0
-            _, size_1 = states[0][embedding_key].shape
-            embdim_pertp = size_1 // num_shards
-            tok_emb_list = [
-                torch.concat(
-                    [
-                        states[tp][embedding_key][:, embdim_pertp * local_rank : embdim_pertp * (local_rank + 1)]
-                        for tp in range(num_shards)
-                    ],
-                    dim=0,
-                )
-                for local_rank in range(num_shards)
-            ]
-        state_dict.update(
-            {
-                "model.norm.weight": states[0]["norm.weight"],
-                "model.embed_tokens.weight": torch.cat(tok_emb_list, dim=embed_concat_dim),
-                "lm_head.weight": torch.cat([states[i]["output.weight"] for i in range(num_shards)], dim=0),
-            },
-        )
-
-        # save state_dict to hf format
-        shards, index = shard_checkpoint(state_dict, weights_name=SAFE_WEIGHTS_NAME)
-        for shard_file, shard in shards.items():
-            llm_save(save_path=os.path.join(tgt, shard_file), saved_obj=shard, metadata={"format": "pt"})
-        if index is not None:
-            # Save the index as well
-            llm_save(save_path=os.path.join(tgt, SAFE_WEIGHTS_INDEX_NAME), saved_obj=index)
+        raise NotImplementedError
