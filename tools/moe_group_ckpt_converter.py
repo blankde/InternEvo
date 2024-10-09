@@ -26,18 +26,21 @@ def list_to_group_ckpt_tp(src, tgt, ep_size, num_layer, num_local_experts, max_t
     for layer_id in tqdm(range(num_layer)):
         for tp_rank in range(max_tp):
             for expp_rank in range(ep_size):
-                # merge into a big mlp
+                # merge local experts into grouped mlp
                 expert_state_dict = dict()
+                # expert_w_state[key][expert] = weight
                 expert_w_state = {"w1": [], "w2": [], "w3": []}
                 expert_ids = range(num_local_experts * expp_rank, num_local_experts * (expp_rank + 1))
                 for global_expert_id in expert_ids:
                     fn = f"model_moe_layer{layer_id}_expert{global_expert_id}_tp{tp_rank}.pt"
                     fp = os.path.join(src, fn)
-                    cur_expert_state_dict = load(fp)
+                    origin_state = load(fp)
                     pattern = r"(.*?\.moe_layer\.experts\.wrapped_experts)\.\d+\.(w\d+)(?:\.weight)?"
-                    for key, weight in cur_expert_state_dict.items():
+                    for key, weight in origin_state.items():
                         moe_str_prefix, w_i = re.search(pattern, key).group(1), re.search(pattern, key).group(2)
+                        # [d2, d1] -> [d1, d2]
                         expert_w_state[w_i].append(weight.T)
+                # k*[d1, d2] -> [k, d1, d2]
                 for key, weights in expert_w_state.items():
                     local_key = f"{moe_str_prefix}.{expp_rank}.{key}{weight_key_suffix}"
                     expert_state_dict[local_key] = torch.stack(weights, dim=0)
@@ -53,23 +56,23 @@ def group_to_list_ckpt_tp(src, tgt, ep_size, num_layer, num_local_experts, max_t
     for layer_id in tqdm(range(num_layer)):
         for tp_rank in range(max_tp):
             for expp_rank in range(ep_size):
-                # split
+                # split group mlp to local experts, expert_w_state[key][expert] = weight
                 expert_w_state = {"w1": [], "w2": [], "w3": []}
                 fn = f"model_moe_layer{layer_id}_expert{expp_rank}_tp{tp_rank}.pt"
                 fp = os.path.join(src, fn)
-                cur_expert_state_dict = load(fp)
+                origin_state = load(fp)
                 pattern = r"(.*?\.moe_layer\.experts\.wrapped_experts)\.\d+\.(w\d+)(?:\.weight)?"
                 for local_expert_id in range(num_local_experts):
-                    expert_state_dict = {}
+                    expert_state_dict = dict()
                     global_expert_id = expp_rank * num_local_experts + local_expert_id
-                    # breakpoint()
-                    for key, weight in cur_expert_state_dict.items():
+                    for key, weight in origin_state.items():
                         moe_str_prefix, w_i = re.search(pattern, key).group(1), re.search(pattern, key).group(2)
+                        # [k, d1, d2] -> k * [d1, d2]
                         expert_w_state[w_i] = weight.chunk(num_local_experts)
                         local_key = key.replace(f"{moe_str_prefix}.{expp_rank}", f"{moe_str_prefix}.{global_expert_id}")
+                        # [d2, d1] -> [d1, d2]
                         value = expert_w_state[w_i][local_expert_id].squeeze().T
                         expert_state_dict[local_key] = value
-                    # breakpoint()
                     torch.save(
                         expert_state_dict,
                         os.path.join(tgt, f"model_moe_layer{layer_id}_expert{global_expert_id}_tp{tp_rank}.pt"),
@@ -81,6 +84,7 @@ def list_to_group_ckpt_wp(src, tgt, ep_size, num_layer, num_local_experts, max_w
 
     for layer_id in tqdm(range(num_layer)):
         for expp_rank in range(ep_size):
+            # expert_w_state[key][expert][wp]=weight
             expert_w_state = {
                 "w1": [[] for _ in range(num_local_experts)],
                 "w2": [[] for _ in range(num_local_experts)],
@@ -91,12 +95,15 @@ def list_to_group_ckpt_wp(src, tgt, ep_size, num_layer, num_local_experts, max_w
                 for wp_rank in range(max_wp):
                     fn = f"model_moe_layer{layer_id}_expert{global_expert_id}_wp{wp_rank}.pt"
                     fp = os.path.join(src, fn)
-                    cur_expert_state_dict = load(fp)
+                    origin_state = load(fp)
                     pattern = r"(.*?\.moe_layer\.experts\.wrapped_experts)\.\d+\.(w\d+)(?:\.weight)?"
-                    for key, weight in cur_expert_state_dict.items():
+                    for key, weight in origin_state.items():
                         moe_str_prefix, w_i = re.search(pattern, key).group(1), re.search(pattern, key).group(2)
+                        # [d2/2, d1] -> [d1, d2/w]
                         expert_w_state[w_i][local_expert_id].append(weight.T)
+            # expert_state_dict[wp][key] = value
             expert_state_dict = [{} for _ in range(max_wp)]
+            # k*w*[d1,d2/w] -> k*[d1, d2] -> [k*d1, d2] -> w*[k/w*d1, w*d2]
             for key, weights in expert_w_state.items():
                 flat_weights = [torch.cat(row, dim=1) for row in weights]
                 full_weights = torch.cat(flat_weights, dim=0).chunk(max_wp, dim=0)
@@ -116,6 +123,7 @@ def group_to_list_ckpt_wp(src, tgt, ep_size, num_layer, num_local_experts, max_w
 
     for layer_id in tqdm(range(num_layer)):
         for expp_rank in range(ep_size):
+            # expert_w_state[key][wp]=weight
             expert_w_state = {
                 "w1": [None for _ in range(max_wp)],
                 "w2": [None for _ in range(max_wp)],
@@ -124,14 +132,16 @@ def group_to_list_ckpt_wp(src, tgt, ep_size, num_layer, num_local_experts, max_w
             for wp_rank in range(max_wp):
                 fn = f"model_moe_layer{layer_id}_expert{expp_rank}_wp{wp_rank}.pt"
                 fp = os.path.join(src, fn)
-                cur_expert_state_dict = load(fp)
+                origin_state = load(fp)
                 pattern = r"(.*?\.moe_layer\.experts\.wrapped_experts)\.\d+\.(w\d+)(?:\.weight)?"
-                for key, weight in cur_expert_state_dict.items():
+                for key, weight in origin_state.items():
                     moe_str_prefix, w_i = re.search(pattern, key).group(1), re.search(pattern, key).group(2)
                     expert_w_state[w_i][wp_rank] = weight
 
+            # expert_state_dict[expert][wp][key] = value
             expert_state_dict = [[{} for _ in range(max_wp)] for _ in range(num_local_experts)]
             for key, weight in expert_w_state.items():
+                # w*[k*d1/w, d2] -> [k*d1, d2] -> k*[d1, d2/w]
                 full_weight = torch.cat(weight, dim=0).chunk(num_local_experts, dim=0)
                 flat_weight = [row.chunk(max_wp, dim=1) for row in full_weight]
                 for local_expert_id in range(num_local_experts):
