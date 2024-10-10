@@ -152,6 +152,7 @@ class DroplessMoELayer(BaseMoELayer):
         moe_grouped_mlp: bool = True,
         enable_fused_permute: bool = True,
         token_dispatch_policy: str = "alltoall",
+        deterministic_mode: bool = False,
     ) -> None:
         assert noisy_gate_policy is None or noisy_gate_policy in ["None", "Jitter", "RSample"], (
             "Unsupported noisy_gate_policy: " + noisy_gate_policy
@@ -199,6 +200,7 @@ class DroplessMoELayer(BaseMoELayer):
         assert len(self.local_expert_indices) > 0, "Expected at least one local expert index"
         self.topk = top_k
         self.moe_grouped_mlp = moe_grouped_mlp
+        self.deterministic_mode = deterministic_mode
 
         self.drop_and_pad = drop_and_pad
         self.capacity_factor = capacity_factor
@@ -274,7 +276,10 @@ class DroplessMoELayer(BaseMoELayer):
     def topk_softmax_with_capacity(self, gates):
         expert_weights, indices = torch.topk(gates, self.topk, dim=1)
         expert_weights /= expert_weights.sum(dim=-1, keepdim=True)
-        num_local_tokens_per_expert = torch.histc(indices, bins=self.num_experts, min=0, max=self.num_experts)
+        if self.deterministic_mode:
+            num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
+        else:
+            num_local_tokens_per_expert = torch.histc(indices, bins=self.num_experts, min=0, max=self.num_experts)
 
         # without capacity
         if self.capacity_factor is None:
@@ -348,7 +353,10 @@ class DroplessMoELayer(BaseMoELayer):
         # NOTE: bincount seem slower than histc
         # num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
         if self.capacity_factor is not None:
-            num_local_tokens_per_expert = torch.histc(indices, bins=self.num_experts, min=0, max=self.num_experts)
+            if self.deterministic_mode:
+                num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
+            else:
+                num_local_tokens_per_expert = torch.histc(indices, bins=self.num_experts, min=0, max=self.num_experts)
         else:
             num_local_tokens_per_expert = tokens_per_expert_before_capacity
         # num_local_tokens_per_expert: [num_experts]
