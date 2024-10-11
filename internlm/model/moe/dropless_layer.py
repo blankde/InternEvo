@@ -276,6 +276,9 @@ class DroplessMoELayer(BaseMoELayer):
     def topk_softmax_with_capacity(self, gates):
         expert_weights, indices = torch.topk(gates, self.topk, dim=1)
         expert_weights /= expert_weights.sum(dim=-1, keepdim=True)
+        # we compute num_local_tokens_per_expert here. If no drop and padding, num_local_tokens_per_expert should be
+        # the final value, otherwise we recompute it in self.process(.)
+        # histc(.) can be faster the bincount(.), but will cause non-deterministic behavior
         if self.deterministic_mode:
             num_local_tokens_per_expert = torch.bincount(indices.view(-1), minlength=self.num_experts)
         else:
