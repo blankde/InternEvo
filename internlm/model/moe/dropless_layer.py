@@ -257,8 +257,9 @@ class DroplessMoELayer(BaseMoELayer):
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_inputs = inputs[0].reshape(-1, d_model)
 
-        self.gates = self.gate(reshaped_inputs)
-        expert_weights, indices, tokens_per_expert_before_capacity = self.topk_softmax_with_capacity(self.gates)
+        gates = self.gate(reshaped_inputs)
+        expert_weights, indices, tokens_per_expert_before_capacity = self.topk_softmax_with_capacity(gates)
+        self.l_aux = self.load_balancing_loss(tokens_per_expert_before_capacity, gates)
 
         (dispatched_input, tokens_per_expert) = self.token_permutation_func(
             reshaped_inputs, expert_weights, indices, tokens_per_expert_before_capacity
@@ -433,8 +434,6 @@ class DroplessMoELayer(BaseMoELayer):
             self.num_global_tokens_per_local_expert_cpu = num_global_tokens_per_local_expert.view(
                 -1, self.num_local_experts
             ).to(torch.device("cpu"), non_blocking=True)
-
-        self.l_aux = self.load_balancing_loss(tokens_per_expert_before_capacity, self.gates)
 
         return num_tokens_per_local_expert
 
