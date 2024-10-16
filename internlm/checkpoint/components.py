@@ -318,14 +318,16 @@ def load_optimizer_checkpoint(folder, optim):
             else:
                 if fn.startswith("optimizer_ep"):
                     is_moe_optim = True
-                    _, ep, tp, pp, zero = os.path.splitext(fn)[0].split("_")
+                    _, ep, tp, pp, moe_zero = os.path.splitext(fn)[0].split("_")
                 else:
                     _, tp, pp, zero = os.path.splitext(fn)[0].split("_")
-                max_zero = max(max_zero, int(zero[2:]))
                 max_tp = max(max_tp, int(tp[2:]))
                 max_pp = max(max_pp, int(pp[2:]))
                 if is_moe_optim:
                     max_ep = max(max_ep, int(ep[2:]))
+                    max_moe_zero = max(max_moe_zero, int(moe_zero[2:]))
+                else:
+                    max_zero = max(max_zero, int(zero[2:]))
 
     zero_size = gpc.get_world_size(ParallelMode.ZERO1)
     tp_size = gpc.get_world_size(ParallelMode.TENSOR)
