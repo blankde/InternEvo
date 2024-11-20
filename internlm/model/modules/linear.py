@@ -461,19 +461,27 @@ class GroupedGemmWPFusedDenseFunc(torch.autograd.Function):
         backend = ctx.backend
         full_weight_shape = ctx.full_weight_shape
 
+        if grad_output.numel() == 0:
+            if ctx.needs_input_grad[1]:
+                total_weight_shape = torch.Size(
+                    (full_weight_shape.numel() // full_weight_shape[-1], full_weight_shape[-1])
+                )
+                grad_weight = torch.zeros(total_weight_shape, dtype=weight.dtype)
+                grad_weight, grad_weight_sync = communicator.grad_hook(
+                    grad_weight, async_op=True, module=module, is_bias=False
+                )
+            if ctx.needs_input_grad[0]:
+                grad_input = torch.zeros_like(x)
+            if ctx.needs_input_grad[1]:
+                grad_weight_sync.wait()
+
+            return grad_input, grad_weight, None, None, None, None, None
+
         grad_output = grad_output.contiguous()
 
         total_weight = communicator.weight_hook(weight, module=module)
         total_weight = total_weight.reshape(full_weight_shape)
         grad_input, grad_weight = None, None
-        if grad_output.numel() == 0:
-            if ctx.needs_input_grad[0]:
-                grad_input = torch.zeros_like(x)
-            if ctx.needs_input_grad[1]:
-                grad_weight = torch.zeros_like(total_weight).reshape(-1, full_weight_shape[-1])
-                grad_weight, _ = communicator.grad_hook(grad_weight, async_op=False, module=module, is_bias=False)
-
-            return grad_input, grad_weight, None, None, None, None, None
 
         if ctx.needs_input_grad[1]:
             assert ctx.compute_weight_gradient
