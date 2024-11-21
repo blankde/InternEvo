@@ -344,6 +344,9 @@ class GroupedGemmSPFusedDenseFunc(torch.autograd.Function):
         ctx.compute_weight_gradient = weight.requires_grad
         ctx.backend = backend
 
+        saved_x = None if ctx.compute_weight_gradient is False else x
+        ctx.save_for_backward(saved_x, weight, batch_sizes)
+
         if torch.is_autocast_enabled():
             x = x.to(dtype=torch.get_autocast_gpu_dtype())
         x = x.contiguous()
@@ -354,12 +357,9 @@ class GroupedGemmSPFusedDenseFunc(torch.autograd.Function):
             if input_numel == 0:
                 # if inp is empty, reshape to make grad flow.
                 # inp shape: (0, hdim)
-                reshaped_weight = weight.view(x.shape[-1], -1)
+                weight = weight.view(x.shape[-1], -1)
 
-            output = torch.matmul(x, reshaped_weight)
-
-        saved_x = None if ctx.compute_weight_gradient is False else x
-        ctx.save_for_backward(saved_x, weight, batch_sizes)
+            output = torch.matmul(x, weight)
 
         assert len(output.shape) == len(x.shape)
 
