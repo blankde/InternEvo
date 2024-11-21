@@ -354,12 +354,14 @@ class GroupedGemmSPFusedDenseFunc(torch.autograd.Function):
             if input_numel == 0:
                 # if inp is empty, reshape to make grad flow.
                 # inp shape: (0, hdim)
-                weight = weight.view(x.shape[-1], -1)
+                reshaped_weight = weight.view(x.shape[-1], -1)
 
-            output = torch.matmul(x, weight)
+            output = torch.matmul(x, reshaped_weight)
 
         saved_x = None if ctx.compute_weight_gradient is False else x
         ctx.save_for_backward(saved_x, weight, batch_sizes)
+
+        assert len(output.shape) == len(x.shape)
 
         return output
 
@@ -371,6 +373,14 @@ class GroupedGemmSPFusedDenseFunc(torch.autograd.Function):
         grad_output = grad_output.contiguous()
         x, weight, batch_sizes = ctx.saved_tensors
         grad_input, grad_weight = None, None
+
+        if grad_output.numel() == 0:
+            if ctx.needs_input_grad[1]:
+                grad_weight = torch.zeros_like(weight)
+            if ctx.needs_input_grad[0]:
+                grad_input = torch.zeros_like(x)
+
+            return grad_input, grad_weight, None, None, None, None, None
 
         if ctx.needs_input_grad[1]:
             assert ctx.compute_weight_gradient
@@ -449,6 +459,8 @@ class GroupedGemmWPFusedDenseFunc(torch.autograd.Function):
 
         saved_x = None if ctx.compute_weight_gradient is False else x
         ctx.save_for_backward(saved_x, weight, batch_sizes)
+
+        assert len(output.shape) == len(x.shape)
 
         return output
 
