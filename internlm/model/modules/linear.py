@@ -466,7 +466,7 @@ class GroupedGemmWPFusedDenseFunc(torch.autograd.Function):
                 total_weight_shape = torch.Size(
                     (full_weight_shape.numel() // full_weight_shape[-1], full_weight_shape[-1])
                 )
-                grad_weight = torch.zeros(total_weight_shape, dtype=weight.dtype)
+                grad_weight = torch.zeros(total_weight_shape, dtype=weight.dtype, device=weight.device)
                 grad_weight, grad_weight_sync = communicator.grad_hook(
                     grad_weight, async_op=True, module=module, is_bias=False
                 )
