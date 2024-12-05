@@ -76,6 +76,24 @@ class _RMSNorm(torch.nn.Module):
             _norm_func = manual_rms_norm
             return _norm_func(_input, self.weight, self.normalized_shape, self.eps, self.add_unit_offset)
 
+
+    def explicit_forward(self, ctx, _input: torch.Tensor):
+        if apex_rmsnorm_impl:
+            args = _cast_if_autocast_enabled(input, self.weight, self.normalized_shape, self.eps)
+            with torch.amp.autocast('cuda', enabled=False):
+                return FusedRMSNormAffineMixedDtypesFunction.forward(ctx, *args)
+        else:
+            assert False
+
+    def explicit_forward(self, ctx, grad_output: torch.Tensor):
+        if apex_rmsnorm_impl:
+            with torch.amp.autocast('cuda', enabled=False):
+                grad_input, grad_weight, *_ = FusedRMSNormAffineMixedDtypesFunction.backward(ctx, grad_output)
+        else:
+            assert False   
+
+        return grad_input, grad_weight
+
     def reset_parameters(self):
         if self.add_unit_offset:
             init.zeros_(self.weight)

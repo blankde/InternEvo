@@ -555,6 +555,86 @@ def fused_dense_func(
             )
 
 
+def explicit_fused_dense_forward(
+    ctx,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    communicator: Union[TPCommunicator, WPCommunicator],
+    module: Optional[nn.Module] = None,
+    bias: Optional[torch.Tensor] = None,
+    return_residual: bool = False,
+    use_grouped_linear: bool = False,
+    **kwargs,
+):
+    if communicator.communication_mode() == "wp":
+        if not use_grouped_linear:
+            return WPFusedDenseFunc.forward(
+                ctx,
+                x,
+                weight,
+                bias,
+                module,
+                communicator,
+                return_residual,
+            )
+        else:
+            batch_sizes = kwargs.pop("batch_sizes", None)
+            backend = kwargs.pop("backend", "gmm")
+            full_weight_shape = kwargs.pop("full_weight_shape", None)
+            return GroupedGemmWPFusedDenseFunc.forward(
+                ctx,
+                x,
+                weight,
+                module,
+                communicator,
+                batch_sizes,
+                backend,
+                full_weight_shape,
+            )
+    else:  # mtp, msp, and fsp
+        if not use_grouped_linear:
+            return SPFusedDenseFunc.forward(
+                ctx,
+                x,
+                weight,
+                bias,
+                communicator,
+                return_residual,
+            )
+        else:
+            # TODO: support grouped linear for mtp, msp, and fsp
+            batch_sizes = kwargs.pop("batch_sizes", None)
+            backend = kwargs.pop("backend", "gmm")
+            return GroupedGemmSPFusedDenseFunc.forward(
+                ctx,
+                x,
+                weight,
+                batch_sizes,
+                backend,
+            )
+
+
+def explicit_fused_dense_backward(
+    ctx,
+    grad_output: torch.Tensor,
+):
+    if communicator.communication_mode() == "wp":
+        if not use_grouped_linear:
+            grad_input, grad_weight, grad_bias, *_ = WPFusedDenseFunc.backward(ctx, grad_output)
+        else:
+            grad_input, grad_weight = GroupedGemmWPFusedDenseFunc.backward(ctx, grad_output)
+            grad_bias = None
+    else:  # mtp, msp, and fsp
+        if not use_grouped_linear:
+            grad_input, grad_weight, grad_bias, *_ = SPFusedDenseFunc.backward(ctx, grad_output)
+        else:
+            # TODO: support grouped linear for mtp, msp, and fsp
+            grad_input, grad_weight =  GroupedGemmSPFusedDenseFunc.backward(ctx, grad_output)
+            grad_bias = None
+    
+    return grad_input, grad_weight, grad_bias
+
+
 class ParallelLinearWithCommExt(nn.Linear):
     """
     Parallel linear with commuication extention.
