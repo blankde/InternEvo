@@ -26,6 +26,8 @@ from internlm.model.utils import (
 from internlm.solver.activation_checkpoint import activation_checkpoint
 from internlm.utils.logger import get_logger
 
+from internlm.model.moe.ampipe.ampipe import AttMoEPipe, bias_dropout_add_fused_train
+
 logger = get_logger(__file__)
 
 
@@ -217,30 +219,46 @@ class Internlm1MoEDecoder(nn.Module):
             residual = residual.to(torch.float32)
 
         mixer_kwargs = convert_attn_args_to_kwargs(args, kwargs)
-        hidden_states = self.mixer(hidden_states, **mixer_kwargs)
 
-        def _dropout_and_norm_ffn(_residual, _hidden_states):
-            _dropped = self.dropout2(_hidden_states)
-            _residual = (_dropped + _residual) if _residual is not None else _dropped
-            _hidden_states = self.norm2(_residual.float())
-            return _residual, _hidden_states
+        if gpc.config.model.ampipe_degree < 1:
+            hidden_states = self.mixer(hidden_states, **mixer_kwargs)
 
-        if self.dropout_selective_checkpoint:
-            residual, hidden_states = activation_checkpoint(_dropout_and_norm_ffn, False, residual, hidden_states)
+            def _dropout_and_norm_ffn(_residual, _hidden_states):
+                _dropped = self.dropout2(_hidden_states)
+                _residual = (_dropped + _residual) if _residual is not None else _dropped
+                _hidden_states = self.norm2(_residual.float())
+                return _residual, _hidden_states
+
+            if self.dropout_selective_checkpoint:
+                residual, hidden_states = activation_checkpoint(_dropout_and_norm_ffn, False, residual, hidden_states)
+            else:
+                residual, hidden_states = _dropout_and_norm_ffn(residual, hidden_states)
+
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
+
+            # MLP.
+            if self.num_experts <= 1:  # dense mlp output
+                hidden_states = self.mlp(hidden_states)
+                moe_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+            else:  # MoE output
+                hidden_states, moe_loss, _ = self.mlp(hidden_states)
+
         else:
-            residual, hidden_states = _dropout_and_norm_ffn(residual, hidden_states)
+            mixer_kwargs["skip_score"] = True
+            q, k, v = self.mixer(hidden_states, **mixer_kwargs)
 
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+            flash = self.mixer.inner_attn
+            dense_layer = self.mixer.out_proj
+            ln = self.norm2
 
-        # MLP.
-        if self.num_experts <= 1:  # dense mlp output
-            hidden_states = self.mlp(hidden_states)
-            moe_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
-        else:  # MoE output
-            hidden_states, moe_loss, _ = self.mlp(hidden_states)
+            hidden_states, residual = AttMoEPipe.apply(q, k, v, hidden_states,
+                                                        ln.weight, ln.bias, dense_layer.bias,
+                                                        [flash, dense_layer,
+                                                        gpc.config.model.ampipe_degree, ln, self.dropout2.p, \
+                                                        self.mlp.moe_layer])
 
-        return hidden_states + residual, moe_loss
+        return hidden_states + residual, None
 
 
 class Internlm1MoE(BaseModel):
