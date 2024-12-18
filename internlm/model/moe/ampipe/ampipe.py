@@ -36,7 +36,7 @@ def bias_dropout_add_fused_train(x: torch.Tensor,
                                  prob: float) -> torch.Tensor:
     return bias_dropout_add(x, bias, residual, prob, True)
 
-def bias_dropout_add_ln_fwd(ctx, inp, residual, bias, prob, ln, bias_dropout_add_exec_handler):
+def bias_dropout_add_ln_fwd(ctx, inp, residual, bias, prob, ln):
     ctx.inp = inp
     ctx.residual = residual
     ctx.bias = bias.detach()
@@ -86,10 +86,8 @@ class AttMoEPipe(torch.autograd.Function):
     def forward(ctx, q, k, v, hidden_states, ln_weight, ln_bias, proj_bias, non_params):
         #torch.cuda.synchronize()
         #t0 = time.time()
-
         ctx.non_params = non_params
-        flash, dense_layer, pipe_degree, ln, hidden_dropout, bias_dropout_add_exec_handler, moe \
-            = non_params
+        flash, dense_layer, pipe_degree, ln, hidden_dropout, moe = non_params
         
         ctx.batch_size, seqlen, ctx.head = q.size(0), q.size(1), q.size(2)
 
@@ -139,22 +137,21 @@ class AttMoEPipe(torch.autograd.Function):
                 q_use = rearrange(q[:,base:base+chunk_len], 'b s ... -> (b s) ...')
                 flash_ctx = FakeContext()
                 
-                with random.seed(ParallelMode.Tensor):
+                with random.seed(ParallelMode.TENSOR):
                     output_chunk = flash_attn_fwd(flash_ctx,
                         q_use, k, v, cu_seqlens_q, cu_seqlens, chunk_len, seqlen,
-                        flash.dropout_p if flash.training else 0.0,
+                        flash.dropout.p if flash.training else 0.0,
                         softmax_scale=flash.softmax_scale, causal=True,
                         causal_q_offset=base, #fixed ,
-                        version=1
+                        version=2
                     )
                 ctx.flash_ctx.append(flash_ctx)
-                context_layers.append(rearrange(output_chunk, '(b s) h d -> s b (h d)', b=ctx.batch_size).contiguous())
+                context_layers.append(rearrange(output_chunk, '(b s) h d -> b s (h d)', b=ctx.batch_size).contiguous())
                 base += chunk_len
 
                 dense_ctx = FakeContext()
                 context_layers[-1] = dense_layer.explicit_fwd(dense_ctx, context_layers[-1])
                 ctx.dense_ctx.append(dense_ctx)
-
                 #if DEBUG:
                 #    tensor_list = [torch.empty_like(context_layers[-1] ) for _ in range(mpu.get_tensor_model_parallel_world_size())]
                 #    torch.distributed.all_gather(tensor_list, context_layers[-1] , group=mpu.get_tensor_model_parallel_group())
@@ -163,16 +160,16 @@ class AttMoEPipe(torch.autograd.Function):
 
                 bdal_ctx = FakeContext()
                 ln_output, ln_input = bias_dropout_add_ln_fwd(bdal_ctx, context_layers[-1], \
-                    hidden_states_chunks[c], dense_layer.bias, hidden_dropout, ln, bias_dropout_add_exec_handler)
+                    hidden_states_chunks[c], dense_layer.bias, hidden_dropout, ln)
                 ctx.bdal_ctx.append(bdal_ctx)
                 ln_ins.append(ln_input)
+
             #ln_outs.append(ln_output)
                 #if DEBUG:
                 #    tensor_list = [torch.empty_like(ln_output) for _ in range(mpu.get_tensor_model_parallel_world_size())]
                 #    torch.distributed.all_gather(tensor_list, ln_output, group=mpu.get_tensor_model_parallel_group())
                 #    for t in tensor_list:
                 #        assert (t == ln_output).all().item(), "not same a2a input across tp ranks"
-
 
                 prepare_ctx = FakeContext()
                 a2a_tokens, dispatcher, origin_shape, scores, tokens_per_expert\
@@ -197,7 +194,7 @@ class AttMoEPipe(torch.autograd.Function):
                 #    for t in tensor_list:
                 #        assert (t == intermediate[c]).all().item(), "not same across tp ranks"
 
-                a2a_tokens = moe.tutel_a2a_scatter(intermediate[c], [mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()])
+                a2a_tokens = moe.tutel_a2a_scatter(intermediate[c])
                 intermediate[c] = a2a_tokens
 
                 a2a1_events.append(torch.cuda.current_stream().record_event())
@@ -223,7 +220,7 @@ class AttMoEPipe(torch.autograd.Function):
             with torch.cuda.stream(get_comm()):
                 torch.cuda.current_stream().wait_event(comp_events[c])
 
-                a2a_tokens = moe.tutel_a2a_gather(intermediate[c], [mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()])
+                a2a_tokens = moe.tutel_a2a_gather(intermediate[c])
                 intermediate[c] = a2a_tokens
 
                 a2a2_events.append(torch.cuda.current_stream().record_event())
@@ -236,9 +233,6 @@ class AttMoEPipe(torch.autograd.Function):
 
                 post_ctx = FakeContext()
                 post_out = moe.tutel_post_fwd(post_ctx, intermediate[c], dispatchers[c])
-
-
-
                 ctx.post_ctx.append(post_ctx)
 
                 post_out = post_out.view(origin_shape)
@@ -252,7 +246,7 @@ class AttMoEPipe(torch.autograd.Function):
         torch.cuda.current_stream().wait_stream(get_comp0())
 
         
-        ret = torch.cat(moe_outs), torch.cat(ln_ins)
+        ret = torch.cat(moe_outs), torch.cat(context_layers)
         #torch.cuda.synchronize()
         #te = time.time()
         #if torch.distributed.get_rank() == 0:
@@ -261,8 +255,7 @@ class AttMoEPipe(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_mlp_outs, grad_ln_ins):
-        flash, attn, dense_layer, pipe_degree, ln, hidden_dropout, bias_dropout_add_exec_handler, moe\
-              = ctx.non_params
+        flash, attn, dense_layer, pipe_degree, ln, hidden_dropout, moe = ctx.non_params
 
         grad_mlp_outs = grad_mlp_outs.chunk(pipe_degree)
         grad_ln_ins = grad_ln_ins.chunk(pipe_degree)
@@ -292,7 +285,7 @@ class AttMoEPipe(torch.autograd.Function):
         for c in range(0, pipe_degree):
             with torch.cuda.stream(get_comm()):
                 torch.cuda.current_stream().wait_event(post_events[c])
-                intermediate[c] = moe.tutel_a2a_scatter(intermediate[c], [mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()])
+                intermediate[c] = moe.tutel_a2a_scatter(intermediate[c])
                 a2a2_events.append(torch.cuda.current_stream().record_event())
 
         torch.cuda.synchronize()
@@ -308,7 +301,7 @@ class AttMoEPipe(torch.autograd.Function):
         for c in range(0, pipe_degree):
             with torch.cuda.stream(get_comm()):
                 torch.cuda.current_stream().wait_event(comp_events[c])
-                intermediate[c] = moe.tutel_a2a_gather(intermediate[c], [mpu.get_tensor_model_parallel_world_size(), mpu.get_tensor_model_parallel_group()])
+                intermediate[c] = moe.tutel_a2a_gather(intermediate[c])
                 a2a1_events.append(torch.cuda.current_stream().record_event())
 
         for c in range(0, pipe_degree):

@@ -5,12 +5,15 @@ import torch
 import torch.nn.functional as F
 
 import tutel
+import megablocks_ops
 
 from internlm.core.context import ParallelMode
 from internlm.core.context import global_context as gpc
 from internlm.model.moe.base_layer import BaseMoELayer
 from internlm.model.moe.megablocks.mlp import MegaBlockFeedForward
 from internlm.model.moe.utils import all_to_all
+
+from internlm.model.moe.ampipe.tutel_adapter import extract_critical_encode, encode_bwd, decode_fwd, decode_bwd
 
 try:
     from megablocks import ops
@@ -172,6 +175,47 @@ def get_world_size(group=None):
 #     scale = scale_numerator / scale_denominator
 #     return scale * torch.dot(tokens_per_expert, expert_scores)
 
+
+class TopKGate(torch.nn.Module):
+    """Gate module which implements Top2Gating as described in Gshard_.
+    ::
+        gate = TopKGate(model_dim, num_experts)
+        l_aux, combine_weights, dispatch_mask = gate(input)
+    .. Gshard_: https://arxiv.org/pdf/2006.16668.pdf
+    Args:
+        model_dim (int):
+            size of model embedding dimension
+        num_experts (ints):
+            number of experts in model
+    """
+
+    wg: torch.nn.Linear
+
+    def __init__(
+        self,
+        model_dim: int,
+        num_experts: int,
+        topk: int = 1,
+        noisy_gate_policy: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+
+        # Deepspeed's mechisms, alway use fp32
+        self.wg = torch.nn.Linear(model_dim, num_experts, bias=False)
+        self.k = topk
+
+        self.noisy_gate_policy = noisy_gate_policy
+
+    def forward(self, inputs: torch.Tensor):
+        # input jittering
+        if self.noisy_gate_policy == "Jitter" and self.training:
+            inputs = multiplicative_jitter(inputs, device=inputs.device)
+        logits = self.wg(inputs)
+        gates = F.softmax(logits, dim=1)
+
+        return gates
+
+
 class AmpipeMegaBlockMoE(BaseMoELayer):
     """
     Built on the paper and library Megablocks as described in
@@ -213,7 +257,11 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         self.drop_tokens = drop_tokens
         assert self.ffn_dim % tp_size == 0
         super().__init__(
-            torch.nn.Linear(in_features, num_experts, bias=False),
+            TopKGate(
+                in_features,
+                num_experts,
+                top_k,
+            ),
             MegaBlockFeedForward(
                 in_features,
                 self.ffn_dim // tp_size,
@@ -607,7 +655,7 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         crit, top_experts = tutel.tutel_moe.extract_critical(scores,
                 top_k = self.args.moe_top_k,
                 loss_fn = None,
-                capacity_factor = self.args.moe_capacity_factor
+                capacity_factor = self.capacity_factor
             )
 
         tokens_per_expert = ops.histogram(top_experts.view(-1), self.num_experts)
@@ -632,24 +680,23 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         ctx.x0 = x.detach()
         ctx.x0.requires_grad = True
         with torch.enable_grad():
-            scores = self.router.tutel_forward(ctx.x0)
+            scores = self.gate(ctx.x0.view(-1, x.shape[-1]))
         ctx.scores = scores 
         origin_shape = x.shape 
         x = x.view(-1, origin_shape[-1])
 
-        y, tokens_per_expert, dispatcher = tutel.impls.fast_dispatch.extract_critical_encode(ctx, x, scores,
-                top_k = self.args.moe_top_k,
+        y, tokens_per_expert, dispatcher = extract_critical_encode(ctx, x, scores,
+                top_k = self.top_k,
                 loss_fn = None,
-                capacity_factor = self.args.moe_capacity_factor
+                capacity_factor = self.capacity_factor
             )
-
         return y, dispatcher, origin_shape, scores, tokens_per_expert 
         #y, crit, dispatcher = tutel.tutel_moe.fast_encode(x.to(scores.dtype), crit, True).to(x.dtype)
 
 
     def tutel_prepare_bwd(self, ctx, g_score, g_tokens, g_gates):
         
-        grad_x = tutel.impls.fast_dispatch.encode_bwd(ctx, g_tokens)
+        grad_x = encode_bwd(ctx, g_tokens)
         for g_gate, gate in zip(g_gates, ctx.gates_s):
             gate.backward(g_gate)
 
@@ -663,7 +710,7 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         ctx.tokens = tokens.detach()
         ctx.tokens.requires_grad = True
         with torch.enable_grad():
-            y = self.mlp(ctx.tokens)
+            y = self.experts(ctx.tokens)
             ctx.y = NoBuffer.apply(y)
         return y 
 
@@ -671,30 +718,28 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         ctx.y.backward(g_tokens)
         return ctx.tokens.grad
 
-    def tutel_a2a_scatter(self, tokens, tp_info):
-        group = self.args.expert_parallel_group
-        world_size = get_world_size(group) #world size not include TP ranks
+    def tutel_a2a_scatter(self, tokens):
+        # group = gpc.get_group(ParallelMode.EXPERT)
+        world_size = gpc.get_world_size(ParallelMode.EXPERT) #world size not include TP ranks
         if world_size == 1:
             return tokens 
         
-        tokens = tokens.contiguous()
-        output = torch.empty_like(tokens)
+        # tokens = tokens.contiguous()
+        # output = torch.empty_like(tokens)
 
-        C.AllToAllStatus.init(group, -1, -1)
-        tutel_custom_kernel.all_to_all_with_scale(tokens, output, FAKE_A2A_SCALE)
+        # C.AllToAllStatus.init(group, -1, -1)
+        # tutel_custom_kernel.all_to_all_with_scale(tokens, output, FAKE_A2A_SCALE)
         '''
         torch.distributed.all_to_all_single(output, tokens, group=group)
         if FAKE_A2A_SCALE > 1:
             for i in range(FAKE_A2A_SCALE - 1):
                 torch.distributed.all_to_all_single(output, tokens, group=group)
         '''
-
+        output, _ = all_to_all(tokens, group=gpc.get_group(ParallelMode.EXPERT))
 
         output = output.view([world_size, -1] + list(output.shape[1:]))
         output = output.permute([1, 0] + list(range(2, output.dim())))
-        #print("o0.size: ", output.size()) #torch.Size([1, 8, 1280, 512])
         output = output.contiguous().view(list(output.shape[:1]) + [-1] + list(output.shape[3:]))
-        #[1, 10240, 512]
         #y = tutel.impls.communicate.all_to_all(y, 1, 0, use_2dh=False, group=self.args.expert_parallel_group)
         return output 
     
@@ -717,9 +762,9 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         output = output.contiguous().view(list(output.shape[:1]) + [-1] + list(output.shape[3:]))
         return output 
 
-    def tutel_a2a_gather(self, tokens, tp_info):
-        group = self.args.expert_parallel_group
-        world_size = get_world_size(group)
+    def tutel_a2a_gather(self, tokens):
+        # group = gpc.get_group(ParallelMode.EXPERT)
+        world_size = gpc.get_world_size(ParallelMode.EXPERT)
         if world_size == 1:
             return tokens 
 
@@ -728,11 +773,12 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         reshaped_input = tokens.view(list(tokens.shape[:1]) + [world_size, -1] + list(tokens.shape[2:]))
         reshaped_input = reshaped_input.permute([1, 0] + list(range(2, reshaped_input.dim()))).contiguous()
         #simple_all_to_all(reshaped_input, group, background=True)
-        local_input = torch.empty_like(reshaped_input)
+        # local_input = torch.empty_like(reshaped_input)
 
-        C.AllToAllStatus.init(group, -1, -1)
-        tutel_custom_kernel.all_to_all_with_scale(reshaped_input, local_input, FAKE_A2A_SCALE)
+        # C.AllToAllStatus.init(group, -1, -1)
+        # tutel_custom_kernel.all_to_all_with_scale(reshaped_input, local_input, FAKE_A2A_SCALE)
 
+        local_input, _ = all_to_all(reshaped_input, group=gpc.get_group(ParallelMode.EXPERT))
 
         '''        
         torch.distributed.all_to_all_single(local_input, reshaped_input, group=group)
@@ -743,19 +789,19 @@ class AmpipeMegaBlockMoE(BaseMoELayer):
         '''     
         local_input = local_input.view([-1] + list(local_input.shape[2:]))
 
-        if tp_info[0] > 1 :
-            torch.distributed.all_reduce(local_input, op=torch.distributed.ReduceOp.SUM, group=tp_info[1])
+        # if tp_info[0] > 1 :
+        #     torch.distributed.all_reduce(local_input, op=torch.distributed.ReduceOp.SUM, group=tp_info[1])
 
         return local_input 
     
     def tutel_post_fwd(self, ctx, tokens, dispatcher):
         
-        tokens = tutel.impls.fast_dispatch.decode_fwd(ctx, tokens, dispatcher)
+        tokens = decode_fwd(ctx, tokens.view(-1, tokens.shape(-1)), dispatcher)
 
         return tokens
 
     def tutel_post_bwd(self, ctx, g_tokens):
-        tokens_grad, scores_grad = tutel.impls.fast_dispatch.decode_bwd(ctx, g_tokens)
+        tokens_grad, scores_grad = decode_bwd(ctx, g_tokens)
         return tokens_grad, scores_grad
 
     def forward(self, *inputs) -> torch.Tensor:

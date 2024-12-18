@@ -717,6 +717,33 @@ class ParallelLinearWithCommExt(nn.Linear):
             **mixer_kwargs,
         )
 
+    def explicit_fwd(self, ctx, input: torch.Tensor, batch_sizes: torch.Tensor = None) -> torch.Tensor:  # pylint: disable=W0622
+        _class_name = self.__class__.__name__
+        assert self._communicator is not None, f"{_class_name} should register with a communicator first."
+
+        mixer_kwargs = {}
+        use_grouped_linear = getattr(self, "is_grouped_linear", False)
+        if use_grouped_linear:
+            mixer_kwargs = {
+                "batch_sizes": batch_sizes,
+                "backend": self.backend,
+                "full_weight_shape": self.full_weight_shape if hasattr(self, "full_weight_shape") else None,
+            }
+
+        return explicit_fused_dense_forward(
+            ctx,
+            input,
+            self.weight,
+            communicator=self._communicator,
+            module=self,
+            bias=self.bias,
+            use_grouped_linear=use_grouped_linear,
+            **mixer_kwargs,
+        )
+
+    def explicit_bwd(self, ctx, grad_output: torch.Tensor):
+        return explicit_fused_dense_backward(ctx, grad_output)
+
 
 class ColumnParallelLinear(ParallelLinearWithCommExt):
     """

@@ -1,6 +1,7 @@
 import torch
 import flash_attn_2_cuda 
-import flash_attn_cuda 
+# import flash_attn_cuda 
+flash_attn_cuda = None
 
 def _flash_attn1_forward(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                         dropout_p, softmax_scale, causal, return_softmax, num_splits=0,
@@ -43,12 +44,12 @@ def _flash_attn_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
                                dropout_p, softmax_scale, causal, return_softmax, causal_q_offset):
     maybe_contiguous = lambda x: x.contiguous() if x.stride(-1) != 1 else x
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, q, k, v, out_padded, softmax_lse, S_dmask = flash_attn_2_cuda.varlen_fwd(
+    out, q, k, v, out_padded, softmax_lse, p, rng_state = flash_attn_2_cuda.varlen_fwd(
         q, k, v, None, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
-        softmax_scale, False, causal, return_softmax, causal_q_offset, None
+        softmax_scale, False, causal, return_softmax, None
     )
 
-    return out, q, k, v, out_padded, softmax_lse, S_dmask
+    return out, q, k, v, out_padded, softmax_lse, p, rng_state
 
 def _flash_attn_varlen_backward(dout, q, k, v, out, softmax_lse, dq, dk, dv,
                                 cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
@@ -131,7 +132,7 @@ class FlashAttnFuncMerge(torch.autograd.Function):
             if softmax_scale is None:
                 softmax_scale = q.shape[-1] ** (-0.5)
             ctx.causal_q_offset = causal_q_offset
-            out, q, k, v, out_padded, softmax_lse, S_dmask = _flash_attn_varlen_forward(
+            out, q, k, v, out_padded, softmax_lse, p, rng_state = _flash_attn_varlen_forward(
                 q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p, softmax_scale, causal=causal, return_softmax=return_softmax and dropout_p > 0, causal_q_offset=causal_q_offset
             )
@@ -152,7 +153,7 @@ class FlashAttnFuncMerge(torch.autograd.Function):
                 TIMERS[key][version] = t1 - t0 
             else:
                 TIMERS[key] = {version: t1 - t0}
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        return out if not return_softmax else (out, softmax_lse, p, rng_state)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -249,9 +250,9 @@ def flash_attn_megablock_call(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
 
 def flash_attn_fwd(ctx, q_use, k, v, cu_seqlens_q, cu_seqlens, chunk_len, seqlen, dropout_p, softmax_scale, 
     causal, causal_q_offset, version):
-    assert causal and version == 1
+    # assert causal and version == 1
     out = FlashAttnFuncMerge.forward(ctx, q_use, k, v, cu_seqlens_q, cu_seqlens, chunk_len, seqlen, 
-    dropout_p, softmax_scale, True, False, False, causal_q_offset, 1
+    dropout_p, softmax_scale, True, False, False, causal_q_offset, version
     )
     return out 
 

@@ -1,6 +1,7 @@
 # adopted from https://github.com/NVIDIA/apex/blob/master/apex/normalization/fused_layer_norm
 
 import numbers
+import importlib
 
 import torch
 from torch.nn import init
@@ -12,13 +13,14 @@ from internlm.utils.logger import get_logger
 logger = get_logger(__file__)
 internlm_accelerator = get_accelerator()
 
-try:
-    from apex.normalization.fused_layer_norm import mixed_dtype_fused_rms_norm_affine
+# try:
+from apex.normalization.fused_layer_norm import mixed_dtype_fused_rms_norm_affine
+from apex._autocast_utils import _cast_if_autocast_enabled
 
-    apex_rmsnorm_impl = True
-except (ModuleNotFoundError, ImportError):
-    logger.warning("The torch implementation for MixFusedRMSNorm is slower than apex. Please note this!")
-    apex_rmsnorm_impl = False
+apex_rmsnorm_impl = True
+# except (ModuleNotFoundError, ImportError):
+#     logger.warning("The torch implementation for MixFusedRMSNorm is slower than apex. Please note this!")
+#     apex_rmsnorm_impl = False
 
 try:
     from deeplink_ext.internevo_ops import MixedFusedRMSNorm as _RMSNormDIPU
@@ -53,6 +55,58 @@ def manual_rms_norm(my_input, weight, normalized_shape, eps, add_unit_offset=Fal
     else:
         return weight * my_input
 
+global fused_layer_norm_cuda
+fused_layer_norm_cuda = None
+
+class FusedRMSNormAffineFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, normalized_shape, eps, memory_efficient=False):
+        global fused_layer_norm_cuda
+        if fused_layer_norm_cuda is None:
+            fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
+        ctx.normalized_shape = normalized_shape
+        ctx.eps = eps
+        ctx.memory_efficient = memory_efficient
+        input_ = input.contiguous()
+        weight_ = weight.contiguous()
+        output, invvar = fused_layer_norm_cuda.rms_forward_affine(
+            input_, ctx.normalized_shape, weight_, ctx.eps)
+        if ctx.memory_efficient:
+            ctx.save_for_backward(output, weight_, invvar)
+        else:
+            ctx.save_for_backward(input_, weight_, invvar)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_or_output, weight_, invvar = ctx.saved_tensors
+        grad_input = grad_weight = None
+        grad_input, grad_weight = fused_layer_norm_cuda.rms_backward_affine(
+           grad_output.contiguous(), invvar, input_or_output,
+           ctx.normalized_shape, weight_, ctx.eps, ctx.memory_efficient
+        )
+        return grad_input, grad_weight, None, None, None
+
+class FusedRMSNormAffineMixedDtypesFunction(FusedRMSNormAffineFunction):
+
+    @staticmethod
+    def forward(ctx, input, weight, normalized_shape, eps, memory_efficient=False):
+        global fused_layer_norm_cuda
+        if fused_layer_norm_cuda is None:
+            fused_layer_norm_cuda = importlib.import_module("fused_layer_norm_cuda")
+        ctx.normalized_shape = normalized_shape
+        ctx.eps = eps
+        ctx.memory_efficient = memory_efficient
+        input_ = input.contiguous()
+        weight_ = weight.contiguous()
+        output, invvar = fused_layer_norm_cuda.rms_forward_affine_mixed_dtypes(
+            input_, ctx.normalized_shape, weight_, ctx.eps
+        )
+        if ctx.memory_efficient:
+            ctx.save_for_backward(output, weight_, invvar)
+        else:
+            ctx.save_for_backward(input_, weight_, invvar)
+        return output
 
 class _RMSNorm(torch.nn.Module):
     """A generic module for RMS normalization."""
@@ -77,15 +131,15 @@ class _RMSNorm(torch.nn.Module):
             return _norm_func(_input, self.weight, self.normalized_shape, self.eps, self.add_unit_offset)
 
 
-    def explicit_forward(self, ctx, _input: torch.Tensor):
+    def explicit_fwd(self, ctx, _input: torch.Tensor):
         if apex_rmsnorm_impl:
-            args = _cast_if_autocast_enabled(input, self.weight, self.normalized_shape, self.eps)
+            args = _cast_if_autocast_enabled(_input, self.weight, self.normalized_shape, self.eps)
             with torch.amp.autocast('cuda', enabled=False):
                 return FusedRMSNormAffineMixedDtypesFunction.forward(ctx, *args)
         else:
             assert False
 
-    def explicit_forward(self, ctx, grad_output: torch.Tensor):
+    def explicit_bwd(self, ctx, grad_output: torch.Tensor):
         if apex_rmsnorm_impl:
             with torch.amp.autocast('cuda', enabled=False):
                 grad_input, grad_weight, *_ = FusedRMSNormAffineMixedDtypesFunction.backward(ctx, grad_output)

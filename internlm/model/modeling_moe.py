@@ -3,6 +3,7 @@
 
 import math
 from typing import Optional
+from einops import rearrange
 
 import torch
 from torch import nn
@@ -219,7 +220,6 @@ class Internlm1MoEDecoder(nn.Module):
             residual = residual.to(torch.float32)
 
         mixer_kwargs = convert_attn_args_to_kwargs(args, kwargs)
-
         if gpc.config.model.ampipe_degree < 1:
             hidden_states = self.mixer(hidden_states, **mixer_kwargs)
 
@@ -251,9 +251,12 @@ class Internlm1MoEDecoder(nn.Module):
             flash = self.mixer.inner_attn
             dense_layer = self.mixer.out_proj
             ln = self.norm2
-
+            k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [k, v]]
+            # torch.cuda.synchronize()
+            # breakpoint()
+            # print(q, flush=True)
             hidden_states, residual = AttMoEPipe.apply(q, k, v, hidden_states,
-                                                        ln.weight, ln.bias, dense_layer.bias,
+                                                        ln.weight, None, dense_layer.bias,
                                                         [flash, dense_layer,
                                                         gpc.config.model.ampipe_degree, ln, self.dropout2.p, \
                                                         self.mlp.moe_layer])
@@ -333,6 +336,7 @@ class Internlm1MoE(BaseModel):
         top_k: int = 1,
         num_shared_experts: int = 0,
         moe_layer_kwargs: dict = None,
+        ampipe_degree: str = None,  # pylint: disable=W0613
     ):
         super().__init__()
 
