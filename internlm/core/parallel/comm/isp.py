@@ -22,6 +22,7 @@ from internlm.core.parallel.comm.attn_offload import get_offload_manager
 from internlm.core.parallel.comm.utils import (
     DUMMY_HANDLE_CONST,
     AsyncCommHandle,
+    CommunicatorType,
     _gather,
     _split,
     all_gather_raw,
@@ -1314,9 +1315,16 @@ class ISPCommunicatorWrapper:
 
     def __init__(
         self,
-        isp_communicators: List[ISPCommunicator],
     ) -> None:
-        self.isp_communicators = isp_communicators
+        self.isp_communicators = [None for _ in range(len(CommunicatorType))]
+
+    def set_communicator(self, index, communicator):
+        assert index < len(CommunicatorType)
+        self.isp_communicators[index] = communicator
+
+    def get_communicator(self, index):
+        assert index < len(CommunicatorType)
+        return self.isp_communicators[index]
 
     def pop_reduced_grad(self, key) -> dict:
         for communicator in self.isp_communicators:

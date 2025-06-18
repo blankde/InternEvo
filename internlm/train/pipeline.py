@@ -57,7 +57,11 @@ from internlm.core.parallel.comm.tensor import (
     SequenceParallelCommunicator,
     TensorParallelCommunicator,
 )
-from internlm.core.parallel.comm.zero import ParamAsyncBcastHandler
+from internlm.core.parallel.comm.utils import CommunicatorType
+from internlm.core.parallel.comm.zero import (
+    ParamAsyncBcastHandler,
+    ParamAsyncBcastHandlerWrapper,
+)
 from internlm.core.trainer import TrainState
 from internlm.data.utils import unpack_type_ids
 from internlm.model.builder import create_model
@@ -530,6 +534,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
     _retain_out_sharded = gpc.config.model.get("parallel_output", True)
 
     if is_using_isp():
+        isp_communicator_wrapper = ISPCommunicatorWrapper()
         isp_communicator = ISPCommunicator(
             model,
             ISPCommModelConfig(
@@ -544,6 +549,7 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
             early_reduce_scatter_release=gpc.config.parallel.weight.early_reduce_scatter_release,
             enable_layer_fuse_isp_comm=gpc.config.parallel.weight.get("layer_fuse_isp_comm", False),
         )
+        isp_communicator_wrapper.set_communicator(CommunicatorType.Non_MoE, isp_communicator)
         # register communicator for isp column parallel linear.
         ColumnParallelLinear.register_cls_communicator(isp_communicator)
         # row parallel linear will not be used.
@@ -571,15 +577,12 @@ def initialize_parallel_communicator(model: Union[nn.Module, nn.ModuleList]):
                 early_reduce_scatter_release=gpc.config.parallel.expert_weight.early_reduce_scatter_release,
                 enable_layer_fuse_isp_comm=gpc.config.parallel.expert_weight.get("layer_fuse_isp_comm", False),
             )
+            isp_communicator_wrapper.set_communicator(CommunicatorType.MoE, moe_isp_communicator)
             for moe in _submodule_filter(model, Experts):
                 for column_linear in _submodule_filter(moe, (ColumnParallelLinear, GroupedWPLinear)):
                     column_linear.register_communicator(moe_isp_communicator)
                 for row_linear in _submodule_filter(moe, RowParallelLinear):
                     row_linear.register_communicator(None)
-
-            isp_communicator_wrapper = ISPCommunicatorWrapper([isp_communicator, moe_isp_communicator])
-        else:
-            isp_communicator_wrapper = ISPCommunicatorWrapper([isp_communicator])
 
     # register communictor for mtp/msp/fsp linear.
 
@@ -730,9 +733,20 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
         zero_cfg.overlap_sync_grad = False
 
     if zero_cfg.overlap_sync_param:
-        param_bcast_sync_handler = ParamAsyncBcastHandler(ParallelMode.ZERO1, model, isp_communicator)
+        param_bcast_sync_handle_wrapper = ParamAsyncBcastHandlerWrapper()
+        non_moe_isp_communicator = (
+            isp_communicator.get_communicator(CommunicatorType.Non_MoE) if isp_communicator else None
+        )
+        param_bcast_sync_handler = ParamAsyncBcastHandler(ParallelMode.ZERO1, model, non_moe_isp_communicator)
+        param_bcast_sync_handle_wrapper.set_handle(CommunicatorType.Non_MoE, param_bcast_sync_handler)
+        if gpc.config.model.get("num_experts", 1) > 1:
+            moe_isp_communicator = isp_communicator.get_communicator(CommunicatorType.MoE) if isp_communicator else None
+            moe_param_bcast_sync_handler = ParamAsyncBcastHandler(
+                ParallelMode.EXPERT_DATA, model, moe_isp_communicator, is_moe=True
+            )
+            param_bcast_sync_handle_wrapper.set_handle(CommunicatorType.MoE, moe_param_bcast_sync_handler)
     else:
-        param_bcast_sync_handler = None
+        param_bcast_sync_handle_wrapper = None
 
     if not is_using_fsdp():
         if (
@@ -743,7 +757,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
                 naive_optimizer,
                 grad_scal_cfg=grad_scal_cfg,
                 zero_cfg=zero_cfg,
-                param_bcast_sync_handler=param_bcast_sync_handler,
+                param_bcast_sync_handler=param_bcast_sync_handle_wrapper,
                 isp_communicator=isp_communicator,
             )
         else:
@@ -751,7 +765,7 @@ def initialize_optimizer(model: Union[nn.Module, nn.ModuleList], isp_communicato
                 naive_optimizer,
                 grad_scal_cfg=grad_scal_cfg,
                 zero_cfg=zero_cfg,
-                param_bcast_sync_handler=param_bcast_sync_handler,
+                param_bcast_sync_handler=param_bcast_sync_handle_wrapper,
                 isp_communicator=isp_communicator,
             )
     else:
